@@ -23,6 +23,7 @@ CAMADA_DIRETA = "MATCH_DIRETO"
 CAMADA_UNICA = "COMBINACAO_UNICA"
 CAMADA_FIFO = "FIFO"
 CAMADA_MANUAL = "REVISAO_MANUAL"
+CAMADA_AGUARDANDO = "AGUARDANDO_DOCUMENTO"
 
 
 def _igual(a: float, b: float, tol: float = TOLERANCIA_VALOR) -> bool:
@@ -131,17 +132,52 @@ def conciliar_pagamento_jadlog(guia: dict, comprovante: dict) -> dict:
 def _combinacoes_validas(
     pendentes: list[dict], alvo: float, tol: float = TOLERANCIA_VALOR
 ) -> list[list[dict]]:
-    """Retorna todas as combinações de reembolsos que fecham o valor alvo."""
-    validas = []
-    n = len(pendentes)
-    for tamanho in range(1, n + 1):
-        for combo in combinations(pendentes, tamanho):
-            valores = [r.get("valor_reembolso_esperado") or 0 for r in combo]
-            if _igual(_soma(valores), alvo, tol):
-                validas.append(list(combo))
-                if len(validas) > MAX_COMBINACOES:
-                    log.warning("Limite de combinações atingido (%d)", MAX_COMBINACOES)
-                    return validas
+    """Retorna combinações de reembolsos que fecham o valor alvo.
+
+    Programação dinâmica sobre centavos com poda: guarda apenas UMA
+    combinação por soma (a primeira encontrada), o que mantém o custo
+    em O(n * alvo_centavos) mesmo com 50+ pendentes. A força bruta
+    anterior estourava o MAX_COMBINACOES e a versão com múltiplas
+    combinações por soma travava por explosão de memória.
+    """
+    if alvo is None or alvo <= 0:
+        return []
+
+    alvo_cent = int(round(alvo * 100))
+    tol_cent = int(round(tol * 100))
+    teto = alvo_cent + tol_cent
+
+    itens = []
+    for i, r in enumerate(pendentes):
+        v = r.get("valor_reembolso_esperado") or 0
+        c = int(round(v * 100))
+        if 0 < c <= teto:
+            itens.append((i, c))
+
+    if not itens:
+        return []
+
+    # dp[soma] = tupla de índices da PRIMEIRA combinação que atinge essa soma
+    dp: dict[int, tuple[int, ...]] = {0: ()}
+
+    for idx, valor in itens:
+        for soma, combo in list(dp.items()):
+            nova = soma + valor
+            if nova > teto or nova in dp:
+                continue
+            dp[nova] = combo + (idx,)
+
+    validas: list[list[dict]] = []
+    for soma in range(max(0, alvo_cent - tol_cent), teto + 1):
+        combo = dp.get(soma)
+        if not combo:
+            continue
+        validas.append([pendentes[i] for i in combo])
+        if len(validas) > MAX_COMBINACOES:
+            log.warning("Limite de combinações atingido (%d)", MAX_COMBINACOES)
+            break
+
+    validas.sort(key=len)
     return validas
 
 
@@ -317,7 +353,7 @@ def conciliar_remessa(
     else:
         resultado["lado_cliente"] = {
             "status": Status.AGUARDANDO,
-            "camada": CAMADA_MANUAL,
+            "camada": CAMADA_AGUARDANDO,
             "score": 0,
             "quitados": [],
             "diferenca": None,

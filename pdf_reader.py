@@ -1,9 +1,7 @@
 """Extração de campos estruturados por tipo de documento.
-
 Etapa 5: consulta o cache de layouts por hash antes de tentar todos os
 rótulos. Se o formato já foi visto, usa os rótulos que funcionaram.
 """
-
 import re
 from pathlib import Path
 
@@ -12,6 +10,7 @@ from config import TipoDoc
 from log_manager import get_logger
 from ocr_engine import extrair_texto
 from utils import normalizar_cnpj, parse_data, parse_valor
+from valor_tolerante import valor_tolerante
 
 log = get_logger("pdf_reader")
 
@@ -24,6 +23,7 @@ RE_VALOR_BRL = re.compile(r"R?\$?\s*(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})")
 RE_DATA_BR = re.compile(r"(\d{2}[/.-]\d{2}[/.-]\d{4})")
 
 UFS = "AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO"
+
 BANCOS = (
     "ITAU",
     "ITAÚ",
@@ -53,6 +53,10 @@ ROTULOS_DATA_GENERICOS = [
     r"emiss[ãa]o",
     r"data",
 ]
+
+# Rótulos que NÃO são regex: nunca devem ser gravados no cache nem usados
+# como chave de busca. "fallback" e "tolerante" são marcadores internos.
+ROTULOS_INVALIDOS = {"fallback", "tolerante", ""}
 
 
 def _primeiro_cnpj(texto: str) -> str:
@@ -113,40 +117,39 @@ def _data_fallback(texto: str) -> str | None:
 def _valor_com_cache(
     texto: str, rotulos: list[str], rotulo_cache: str | None
 ) -> tuple[float | None, str]:
-    """Consulta o cache primeiro; se falhar, cai na cascata normal."""
-    if rotulo_cache:
+    """Consulta o cache primeiro; se falhar, cai na cascata normal.
+
+    CORREÇÃO: não chama mais _valor_fallback internamente. Se nenhum rótulo
+    casar, retorna (None, "") para que o chamador decida a próxima camada
+    (valor_tolerante antes do fallback genérico).
+    """
+    if rotulo_cache and rotulo_cache not in ROTULOS_INVALIDOS:
         v, _ = _valor_apos_rotulo(texto, [rotulo_cache])
         if v is not None:
             return v, rotulo_cache
-
     v, r = _valor_apos_rotulo(texto, rotulos)
     if v is not None:
         return v, r
-
     v, r = _valor_apos_rotulo(texto, ROTULOS_VALOR_GENERICOS)
     if v is not None:
         return v, r
-
-    return _valor_fallback(texto), ""
+    return None, ""
 
 
 def _data_com_cache(
     texto: str, rotulos: list[str], rotulo_cache: str | None
 ) -> tuple[str | None, str]:
     """Consulta o cache primeiro; se falhar, cai na cascata normal."""
-    if rotulo_cache:
+    if rotulo_cache and rotulo_cache not in ROTULOS_INVALIDOS:
         d, _ = _data_apos_rotulo(texto, [rotulo_cache])
         if d is not None:
             return d, rotulo_cache
-
     d, r = _data_apos_rotulo(texto, rotulos)
     if d is not None:
         return d, r
-
     d, r = _data_apos_rotulo(texto, ROTULOS_DATA_GENERICOS)
     if d is not None:
         return d, r
-
     return _data_fallback(texto), ""
 
 
@@ -223,7 +226,7 @@ def extrair_guia(caminho: Path) -> dict:
     campos["valor_guia"] = valor
     if valor:
         confianca += 20
-        if rotulo:
+        if rotulo and rotulo not in ROTULOS_INVALIDOS:
             rotulos_usados["valor_guia"] = rotulo
 
     data_em, rotulo = _data_com_cache(
@@ -232,7 +235,7 @@ def extrair_guia(caminho: Path) -> dict:
     campos["data_emissao"] = data_em
     if data_em:
         confianca += 10
-        if rotulo:
+        if rotulo and rotulo not in ROTULOS_INVALIDOS:
             rotulos_usados["data_emissao"] = rotulo
 
     data_venc, rotulo = _data_com_cache(
@@ -243,7 +246,7 @@ def extrair_guia(caminho: Path) -> dict:
     campos["data_vencimento"] = data_venc
     if data_venc:
         confianca += 10
-        if rotulo:
+        if rotulo and rotulo not in ROTULOS_INVALIDOS:
             rotulos_usados["data_vencimento"] = rotulo
 
     if campos["numero_nf"]:
@@ -320,7 +323,7 @@ def extrair_comprovante_jadlog(caminho: Path) -> dict:
     campos["data_pagamento_jadlog"] = data
     if data:
         confianca += 15
-        if rotulo:
+        if rotulo and rotulo not in ROTULOS_INVALIDOS:
             rotulos_usados["data_pagamento_jadlog"] = rotulo
 
     valor, rotulo = _valor_com_cache(
@@ -331,7 +334,7 @@ def extrair_comprovante_jadlog(caminho: Path) -> dict:
     campos["valor_pago_jadlog"] = valor
     if valor:
         confianca += 20
-        if rotulo:
+        if rotulo and rotulo not in ROTULOS_INVALIDOS:
             rotulos_usados["valor_pago_jadlog"] = rotulo
 
     campos["confianca"] = min(confianca, 100)
@@ -383,14 +386,25 @@ def extrair_comprovante_cliente(caminho: Path) -> dict:
     if campos["cnpj_pagador"]:
         confianca += 25
 
+    # --- VALOR: cascata corrigida ---
+    # 1) cache + rótulos explícitos (sem fallback interno)
+    # 2) valor_tolerante (corrige OCR corrompido: "38*º" -> 38,00)
+    # 3) _valor_fallback (último recurso)
     valor, rotulo = _valor_com_cache(
         texto, [r"valor\s*pago", r"valor"], cache.get("valor_reembolso")
     )
+    if not valor:
+        valor = valor_tolerante(texto, caminho)
+        rotulo = "tolerante"
+    if not valor:
+        valor = _valor_fallback(texto)
+        rotulo = "fallback"
+
     campos["valor_reembolso"] = valor
     if valor:
         confianca += 25
-        if rotulo:
-            rotulos_usados["valor_reembolso"] = rotulo
+    if rotulo and rotulo not in ROTULOS_INVALIDOS:
+        rotulos_usados["valor_reembolso"] = rotulo
 
     data, rotulo = _data_com_cache(
         texto,
@@ -404,7 +418,7 @@ def extrair_comprovante_cliente(caminho: Path) -> dict:
     campos["data_reembolso"] = data
     if data:
         confianca += 15
-        if rotulo:
+        if rotulo and rotulo not in ROTULOS_INVALIDOS:
             rotulos_usados["data_reembolso"] = rotulo
 
     up = texto.upper()
@@ -426,6 +440,7 @@ def extrair_comprovante_cliente(caminho: Path) -> dict:
     m = re.search(r"ag[êe]ncia[:\s]*([\d.\-]{2,10})", texto, re.IGNORECASE)
     if m:
         campos["agencia"] = m.group(1)
+
     m = re.search(r"conta[:\s]*([\d.\-/]{3,20})", texto, re.IGNORECASE)
     if m:
         campos["conta"] = m.group(1)

@@ -585,16 +585,6 @@ def menu_reprocessar():
     registros = rp.listar_reprocessaveis()
     print()
 
-    if not _pedir_confirmacao("  Confirma o reprocessamento?"):
-        print("\n  Cancelado.")
-        return
-
-    import backup as bk
-
-    bk.criar_backup("reprocessar")
-
-    numeros = [r["numero_remessa"] for r in alvos]
-    resultado = rp.reprocessar_lote(numeros)
     if not registros:
         print("\n  Nenhuma remessa em status reprocessável.")
         print("  (Só entram aqui: revisão, divergências e aguardando reembolso.)")
@@ -638,6 +628,10 @@ def menu_reprocessar():
     if not _pedir_confirmacao("  Confirma o reprocessamento?"):
         print("\n  Cancelado.")
         return
+
+    import backup as bk
+
+    bk.criar_backup("reprocessar")
 
     numeros = [r["numero_remessa"] for r in alvos]
     resultado = rp.reprocessar_lote(numeros)

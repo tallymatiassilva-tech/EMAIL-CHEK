@@ -62,6 +62,11 @@ SINAIS_COMP_JADLOG = {
     "nosso numero": 15,
     "nosso número": 15,
     "banco do brasil cliente": 25,
+    # Formato "PAG DIVERS GUIA C/BAR" (BB)
+    "pag divers guia": 40,
+    "pagador: jadlog": 40,
+    "convenio governo": 30,
+    "convênio governo": 30,
 }
 
 # Sinais fortes de COMPROVANTE CLIENTE (cliente PAGA a Jadlog)
@@ -121,6 +126,12 @@ def _detectar_direcao(texto: str) -> str | None:
     if "cliente: jadlog" in t or "cliente jadlog" in t:
         return "JADLOG"
     if "banco do brasil cliente: jadlog" in t:
+        return "JADLOG"
+
+    # --- Formato "PAG DIVERS GUIA C/BAR" (BB) ---
+    if "pag divers guia" in t and "jadlog" in t:
+        return "JADLOG"
+    if "pagador: jadlog" in t:
         return "JADLOG"
 
     # --- Reembolso explícito ---

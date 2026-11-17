@@ -1,5 +1,6 @@
 """Extração de texto: nativo -> OCR fallback, com cache de layout."""
 
+import os
 from collections import OrderedDict
 from pathlib import Path
 
@@ -33,13 +34,15 @@ except Exception as e:
 
 
 def _montar_config_tessdata() -> str:
-    """Monta a config do Tesseract com o tessdata-dir correto.
+    """Define TESSDATA_PREFIX em vez de --tessdata-dir.
 
-    O caminho vai SEM aspas: o pytesseract já trata o escape, e aspas
-    manuais fazem o Tesseract montar '...tessdata"/por.traineddata'.
+    No Windows o pytesseract quebra o caminho do --tessdata-dir em
+    '...tessdata"/por.traineddata'. TESSDATA_PREFIX evita o problema
+    porque o Tesseract resolve o tessdata sozinho a partir da variável.
     """
     caminho = str(TESSDATA_DIR).strip().strip('"').strip("'").rstrip("\\/")
-    return f"--tessdata-dir {caminho}"
+    os.environ["TESSDATA_PREFIX"] = caminho
+    return ""
 
 
 _TESSERACT_CONFIG = _montar_config_tessdata()

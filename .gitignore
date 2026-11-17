@@ -1,29 +1,50 @@
 # Ambiente virtual
 .venv/
 venv/
-__pycache__/
-*.pyc
+env/
 
-# Dados de clientes e resultados
+# Dados e documentos
 data/
 *.db
-*.db-journal
-*.xlsx
-*.csv
-*.pdf
+*.sqlite
+*.sqlite3
+*.log
 
-# OCR binário
+# Arquivos sensíveis
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+token.json
+config_local.py
+
+# OCR binário (grande demais para git)
 Tesseract-OCR/
 
-# Logs
-logs/
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
 
 # Sistema
 .DS_Store
 Thumbs.db
 desktop.ini
-# Arquivos de teste
-teste_*.py
-testar_*.py
-teste_*.png
-debug_*.py
+
+# Backups
+backup/
+*.bak
+# Planilhas de teste com dados
+*.xlsx
+*.xls
+*.csv
+
+# Scripts de debug e teste
+debug*.py
+teste*.py
+ver_*.py
+limpar_cache*.py
+planilha_*.xlsx
+teste_simples.png
