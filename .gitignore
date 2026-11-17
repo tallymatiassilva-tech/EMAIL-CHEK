@@ -22,3 +22,8 @@ logs/
 .DS_Store
 Thumbs.db
 desktop.ini
+# Arquivos de teste
+teste_*.py
+testar_*.py
+teste_*.png
+debug_*.py
