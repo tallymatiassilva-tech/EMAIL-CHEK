@@ -48,3 +48,17 @@ ver_*.py
 limpar_cache*.py
 planilha_*.xlsx
 teste_simples.png
+
+# Planilhas e imagens de teste
+*.xlsx
+*.xls
+*.csv
+teste_simples.png
+
+# Scripts de diagnostico e teste
+debug*.py
+teste*.py
+ver_*.py
+limpar_cache*.py
+migrar_camada.py
+testar_sistema.py
