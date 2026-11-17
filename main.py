@@ -1,0 +1,456 @@
+"""Ponto de entrada do sistema. Menu interativo de coleta e conciliação.
+
+Fluxo:
+1. Lista TODAS as pastas do Outlook (somente leitura)
+2. Usuário escolhe a pasta de leitura (ou varre a árvore inteira)
+3. Usuário define a pasta de destino dos anexos
+4. Sistema mostra prévia (quantos e-mails, quantos anexos)
+5. Usuário confirma
+6. Sistema baixa os anexos
+7. Usuário pode conciliar os anexos baixados
+8. Usuário pode acompanhar pelo dashboard e exportar para Excel
+"""
+
+import sys
+from pathlib import Path
+
+import database as db
+import persistence as ps
+from config import EMAIL_MAX_AGE_DAYS, PASTA_ANEXOS_PADRAO, Status
+from log_manager import get_logger
+from outlook_reader import (
+    OutlookIndisponivel,
+    coletar_todos,
+    escolher_pasta,
+    listar_emails_recursivo,
+    listar_emails_reembolso,
+    listar_pastas,
+    validar_pasta_destino,
+)
+
+log = get_logger("main")
+
+
+# ---------------------------------------------------------------------------
+# UTILITÁRIOS DE MENU
+# ---------------------------------------------------------------------------
+
+
+def _linha(char="─", n=70):
+    print(char * n)
+
+
+def _titulo(texto):
+    print()
+    _linha("═")
+    print(f"  {texto}")
+    _linha("═")
+
+
+def _pedir_texto(msg, padrao=None):
+    """Pede texto ao usuário. Enter vazio usa o padrão."""
+    if padrao:
+        entrada = input(f"{msg} [{padrao}]: ").strip()
+        return entrada or padrao
+    return input(f"{msg}: ").strip()
+
+
+def _pedir_confirmacao(msg) -> bool:
+    r = input(f"{msg} (s/N): ").strip().lower()
+    return r in ("s", "sim", "y", "yes")
+
+
+# ---------------------------------------------------------------------------
+# ETAPA 1: ESCOLHER PASTA DE LEITURA
+# ---------------------------------------------------------------------------
+
+
+def escolher_pasta_leitura() -> tuple[str | None, bool]:
+    """Retorna (caminho, recursivo).
+
+    Mostra TODAS as pastas e subpastas do Outlook, sem nenhum filtro.
+    recursivo=True quando o usuário escolhe varrer a pasta + todas as subpastas.
+    """
+    _titulo("1. Escolher pasta de leitura no Outlook")
+
+    try:
+        pastas = listar_pastas()
+    except OutlookIndisponivel as e:
+        print(f"\n  ERRO: {e}")
+        print("  Verifique se o Outlook está aberto e tente novamente.")
+        return None, False
+
+    if not pastas:
+        print("\n  Nenhuma pasta encontrada no Outlook.")
+        return None, False
+
+    print(f"\n  {len(pastas)} pastas encontradas (todas as contas e subpastas):\n")
+    for i, p in enumerate(pastas, 1):
+        indent = "   " * p["nivel"]
+        qtd = f"{p['total_itens']:>5}" if p["total_itens"] >= 0 else "    ?"
+        print(f"  {i:>3}. {indent}{p['nome']:<34} ({qtd} itens)")
+
+    print()
+    print(
+        "  Digite o número, parte do nome, ou 'T' para varrer a pasta + todas as subpastas."
+    )
+    entrada = input("  Escolha (Enter = buscar 'REEMBOLSO'): ").strip()
+
+    recursivo = False
+    if entrada.upper() == "T":
+        recursivo = True
+        entrada = ""
+
+    if not entrada:
+        p = escolher_pasta(pastas)
+        if p:
+            print(f"\n  Pasta escolhida: {p['caminho']}")
+            if recursivo:
+                print("  Modo: pasta + todas as subpastas")
+            return p["caminho"], recursivo
+        print("\n  Nenhuma pasta corresponde ao termo padrão.")
+        return None, False
+
+    if entrada.isdigit():
+        idx = int(entrada) - 1
+        if 0 <= idx < len(pastas):
+            p = pastas[idx]
+            print(f"\n  Pasta escolhida: {p['caminho']}")
+            if recursivo:
+                print("  Modo: pasta + todas as subpastas")
+            return p["caminho"], recursivo
+        print(f"\n  Número inválido. Digite entre 1 e {len(pastas)}.")
+        return None, False
+
+    p = escolher_pasta(pastas, entrada)
+    if p:
+        print(f"\n  Pasta escolhida: {p['caminho']}")
+        if recursivo:
+            print("  Modo: pasta + todas as subpastas")
+        return p["caminho"], recursivo
+
+    print(f"\n  Nenhuma pasta encontrada com '{entrada}'.")
+    return None, False
+
+
+# ---------------------------------------------------------------------------
+# ETAPA 2: DEFINIR DESTINO DOS ANEXOS
+# ---------------------------------------------------------------------------
+
+
+def escolher_destino() -> Path | None:
+    _titulo("2. Definir pasta de destino dos anexos")
+    print(f"\n  Padrão: {PASTA_ANEXOS_PADRAO}")
+    print("  Aceita caminho absoluto (D:\\Reembolsos) ou relativo (data\\Anexos)\n")
+
+    while True:
+        entrada = _pedir_texto("  Pasta de destino", str(PASTA_ANEXOS_PADRAO))
+        try:
+            destino = validar_pasta_destino(entrada)
+            print(f"\n  Destino validado: {destino}")
+            return destino
+        except ValueError as e:
+            print(f"\n  ERRO: {e}")
+            if not _pedir_confirmacao("  Tentar outro caminho?"):
+                return None
+
+
+# ---------------------------------------------------------------------------
+# ETAPA 3: PRÉVIA
+# ---------------------------------------------------------------------------
+
+
+def mostrar_previa(
+    caminho_pasta: str, destino: Path, recursivo: bool = False
+) -> list[dict] | None:
+    _titulo("3. Prévia do processamento")
+    print(f"\n  Lendo e-mails de: {caminho_pasta}")
+    if recursivo:
+        print("  Modo: pasta + todas as subpastas")
+    print(f"  Salvando anexos em: {destino}")
+    print(f"  Período: últimos {EMAIL_MAX_AGE_DAYS} dias\n")
+
+    try:
+        if recursivo:
+            emails = listar_emails_recursivo(caminho_pasta)
+        else:
+            emails = listar_emails_reembolso(caminho_pasta)
+    except OutlookIndisponivel as e:
+        print(f"  ERRO: {e}")
+        return None
+
+    if not emails:
+        print("  Nenhum e-mail de reembolso encontrado nessa pasta.")
+        return None
+
+    por_remessa = {}
+    for e in emails:
+        por_remessa.setdefault(e["remessa"], []).append(e)
+
+    total_anexos = 0
+    ja_processados = 0
+    novos = 0
+
+    for remessa, lista in por_remessa.items():
+        for e in lista:
+            try:
+                total_anexos += e["item"].Attachments.Count
+            except Exception:
+                pass
+            if db.email_ja_processado(e["entry_id"]):
+                ja_processados += 1
+            else:
+                novos += 1
+
+    print(f"  E-mails encontrados:      {len(emails)}")
+    print(f"  Remessas distintas:       {len(por_remessa)}")
+    print(f"  Anexos no total:          {total_anexos}")
+    print(f"  E-mails já processados:   {ja_processados} (serão ignorados)")
+    print(f"  E-mails novos:            {novos}")
+
+    if novos == 0:
+        print("\n  Todos os e-mails já foram processados antes. Nada a fazer.")
+        return None
+
+    if recursivo:
+        por_pasta = {}
+        for e in emails:
+            origem = e.get("pasta_origem", "?")
+            por_pasta[origem] = por_pasta.get(origem, 0) + 1
+        if len(por_pasta) > 1:
+            print("\n  E-mails por pasta de origem:")
+            for origem, qtd in sorted(por_pasta.items(), key=lambda x: -x[1]):
+                print(f"    {qtd:>4}  {origem}")
+
+    print("\n  Primeiras remessas:")
+    for i, (remessa, lista) in enumerate(list(por_remessa.items())[:15], 1):
+        anexos = sum(e["item"].Attachments.Count for e in lista)
+        print(f"    {i:>2}. {remessa} — {len(lista)} e-mail(s), {anexos} anexo(s)")
+    if len(por_remessa) > 15:
+        print(f"    ... e mais {len(por_remessa) - 15} remessas")
+
+    return emails
+
+
+# ---------------------------------------------------------------------------
+# ETAPA 4: EXECUÇÃO DA COLETA
+# ---------------------------------------------------------------------------
+
+
+def executar_coleta(caminho_pasta: str, destino: Path, recursivo: bool = False) -> dict:
+    _titulo("4. Baixando anexos")
+    print("\n  Processando... (pode levar alguns minutos)\n")
+
+    resultado = coletar_todos(caminho_pasta, destino, recursivo=recursivo)
+
+    if not resultado.get("ok"):
+        print(f"\n  ERRO: {resultado.get('erro')}")
+        return resultado
+
+    remessas = resultado.get("remessas", {})
+    total_anexos = sum(len(r["anexos"]) for r in remessas.values())
+    pulados = sum(1 for r in remessas.values() if r.get("pulado"))
+
+    print(f"\n  E-mails processados: {resultado['total_emails']}")
+    print(f"  Remessas com anexos: {len(remessas)}")
+    print(f"  Anexos salvos:       {total_anexos}")
+    print(f"  Remessas puladas:    {pulados}")
+
+    return resultado
+
+
+# ---------------------------------------------------------------------------
+# MENU: COLETA
+# ---------------------------------------------------------------------------
+
+
+def menu_coleta():
+    """Fluxo completo de coleta: pasta → destino → prévia → confirmação → download."""
+    _titulo("COLETA DE ANEXOS DO OUTLOOK")
+
+    caminho_pasta, recursivo = escolher_pasta_leitura()
+    if not caminho_pasta:
+        print("\n  Coleta cancelada.")
+        return
+
+    destino = escolher_destino()
+    if not destino:
+        print("\n  Coleta cancelada.")
+        return
+
+    emails = mostrar_previa(caminho_pasta, destino, recursivo=recursivo)
+    if not emails:
+        print("\n  Coleta cancelada.")
+        return
+
+    print()
+    _linha()
+    if not _pedir_confirmacao("  Confirma o download dos anexos?"):
+        print("\n  Coleta cancelada.")
+        return
+
+    executar_coleta(caminho_pasta, destino, recursivo=recursivo)
+
+
+# ---------------------------------------------------------------------------
+# MENU: CONCILIAÇÃO
+# ---------------------------------------------------------------------------
+
+
+def menu_conciliacao():
+    """Concilia os anexos já baixados."""
+    from pipeline import processar_pasta_raiz
+
+    _titulo("CONCILIAÇÃO DE ANEXOS BAIXADOS")
+
+    entrada = _pedir_texto("  Pasta raiz com as remessas", str(PASTA_ANEXOS_PADRAO))
+    raiz = Path(entrada)
+
+    if not raiz.is_dir():
+        print(f"\n  ERRO: pasta não encontrada: {raiz}")
+        return
+
+    subpastas = sorted(p for p in raiz.iterdir() if p.is_dir())
+    if not subpastas:
+        print("\n  Nenhuma subpasta de remessa encontrada.")
+        return
+
+    print(f"\n  {len(subpastas)} remessas encontradas:")
+    for s in subpastas[:15]:
+        n = len(list(s.iterdir()))
+        print(f"    {s.name} — {n} arquivo(s)")
+    if len(subpastas) > 15:
+        print(f"    ... e mais {len(subpastas) - 15}")
+
+    print()
+    if not _pedir_confirmacao("  Confirma a conciliação?"):
+        print("\n  Cancelado.")
+        return
+
+    resultado = processar_pasta_raiz(raiz)
+
+    if not resultado.get("ok"):
+        print(f"\n  ERRO: {resultado.get('motivo')}")
+        return
+
+    print(f"\n  Remessas processadas: {resultado['processadas']}")
+    print(f"  Falhas:               {resultado['falhas']}")
+    print("\n  Detalhe:")
+    for r in resultado["resultados"]:
+        if r.get("ok"):
+            print(f"    {r['remessa']:<20} {str(r['status']):<24} score {r['score']}")
+        else:
+            print(f"    {r['remessa']:<20} ERRO: {r.get('motivo')}")
+
+
+# ---------------------------------------------------------------------------
+# MENU: DASHBOARD
+# ---------------------------------------------------------------------------
+
+
+def menu_dashboard():
+    """Mostra o dashboard de acompanhamento."""
+    from dashboard import mostrar_dashboard
+
+    mostrar_dashboard()
+
+
+# ---------------------------------------------------------------------------
+# MENU: EXPORTAÇÃO
+# ---------------------------------------------------------------------------
+
+
+def menu_exportacao():
+    """Exporta os reembolsos para Excel."""
+    from export_excel import exportar
+
+    _titulo("EXPORTAÇÃO PARA EXCEL")
+    entrada = _pedir_texto("  Caminho do arquivo (Enter = automático)", "")
+    caminho = entrada.strip() or None
+
+    try:
+        arquivo = exportar(caminho)
+        print(f"\n  Arquivo gerado: {arquivo}")
+    except Exception as e:
+        print(f"\n  ERRO: {e}")
+
+
+# ---------------------------------------------------------------------------
+# MENU: ESTATÍSTICAS
+# ---------------------------------------------------------------------------
+
+
+def menu_estatisticas():
+    """Mostra estatísticas do banco."""
+    _titulo("ESTATÍSTICAS DO SISTEMA")
+
+    por_status = ps.estatisticas_por_status()
+    if not por_status:
+        print("\n  Nenhum reembolso no banco ainda.")
+        return
+
+    print("\n  Reembolsos por status:")
+    for status, qtd in sorted(por_status.items(), key=lambda x: -x[1]):
+        print(f"    {status:<32} {qtd:>5}")
+
+    por_camada = ps.estatisticas_por_camada()
+    if por_camada:
+        print("\n  Conciliações por camada:")
+        for camada, qtd in sorted(por_camada.items(), key=lambda x: -x[1]):
+            print(f"    {camada:<32} {qtd:>5}")
+
+    print("\n  Últimas 10 mudanças de status:")
+    for h in ps.historico_recente(10):
+        print(
+            f"    {h['criado_em'][:19]} | {h['numero_remessa']} | "
+            f"{h['status_anterior']} -> {h['status_novo']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# MENU PRINCIPAL
+# ---------------------------------------------------------------------------
+
+
+def menu_principal():
+    """Menu principal do sistema."""
+    db.init_db()
+    ps.init_historico()
+
+    while True:
+        _titulo("SISTEMA DE CONCILIAÇÃO DE REEMBOLSOS — JADLOG")
+        print("\n  1. Coletar anexos do Outlook")
+        print("  2. Conciliar anexos baixados")
+        print("  3. Dashboard de acompanhamento")
+        print("  4. Exportar para Excel")
+        print("  5. Ver estatísticas do banco")
+        print("  6. Sair\n")
+
+        opcao = input("  Escolha uma opção: ").strip()
+
+        if opcao == "1":
+            menu_coleta()
+        elif opcao == "2":
+            menu_conciliacao()
+        elif opcao == "3":
+            menu_dashboard()
+        elif opcao == "4":
+            menu_exportacao()
+        elif opcao == "5":
+            menu_estatisticas()
+        elif opcao == "6":
+            print("\n  Até logo.")
+            break
+        else:
+            print("\n  Opção inválida.")
+
+        print()
+        input("  Pressione Enter para continuar...")
+
+
+if __name__ == "__main__":
+    try:
+        menu_principal()
+    except KeyboardInterrupt:
+        print("\n\n  Interrompido pelo usuário.")
+        sys.exit(0)

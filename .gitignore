@@ -1,0 +1,24 @@
+# Ambiente virtual
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Dados de clientes e resultados
+data/
+*.db
+*.db-journal
+*.xlsx
+*.csv
+*.pdf
+
+# OCR binário
+Tesseract-OCR/
+
+# Logs
+logs/
+
+# Sistema
+.DS_Store
+Thumbs.db
+desktop.ini
