@@ -408,6 +408,170 @@ def menu_estatisticas():
 
 
 # ---------------------------------------------------------------------------
+# MENU: FILA DE TREINAMENTO
+# ---------------------------------------------------------------------------
+
+
+def menu_ver_fila():
+    """Lista a fila de treinamento formatada."""
+    import ver_fila
+
+    _titulo("FILA DE TREINAMENTO")
+
+    entrada = input("  Filtrar por remessa (Enter = todas): ").strip()
+    remessa = entrada or None
+
+    entradas = ver_fila._carregar(remessa=remessa)
+
+    if not entradas:
+        print("\n  Fila vazia. Nenhum documento pendente de treinamento.")
+        return
+
+    print()
+    print(f"  {ver_fila._resumo(entradas)}")
+    print()
+
+    limite = 5
+    for e in entradas[:limite]:
+        print(ver_fila._formatar(e, 800))
+
+    if len(entradas) > limite:
+        print(f"  ... e mais {len(entradas) - limite} entrada(s)")
+        print("  Use a opção 7 para resolver, ou filtre por remessa.")
+
+
+def menu_resolver_fila():
+    """Marca entradas da fila como resolvidas."""
+    import resolver_fila
+    import ver_fila
+
+    _titulo("RESOLVER ITENS DA FILA")
+
+    entradas = ver_fila._carregar()
+    if not entradas:
+        print("\n  Fila vazia. Nada a resolver.")
+        return
+
+    print(f"\n  {len(entradas)} entrada(s) pendente(s):\n")
+    for e in entradas:
+        print(resolver_fila._resumo_entrada(e))
+
+    print()
+    entrada = input(
+        "  IDs para marcar como resolvido (ex: 1 2 3, Enter = cancelar): "
+    ).strip()
+    if not entrada:
+        print("\n  Cancelado.")
+        return
+
+    try:
+        ids = [int(x) for x in entrada.split()]
+    except ValueError:
+        print("\n  ERRO: use apenas números separados por espaço.")
+        return
+
+    alvo = [e for e in entradas if e["id"] in ids]
+    if not alvo:
+        print("\n  Nenhum ID válido entre os pendentes.")
+        return
+
+    print(f"\n  Serão marcadas {len(alvo)} entrada(s):")
+    for e in alvo:
+        print(resolver_fila._resumo_entrada(e))
+
+    print()
+    if not _pedir_confirmacao("  Confirma?"):
+        print("\n  Cancelado. Nada foi alterado.")
+        return
+
+    alteradas = resolver_fila._aplicar(ids, 1)
+    print(f"\n  OK: {alteradas} entrada(s) marcada(s) como resolvida(s).")
+
+
+def menu_ver_layouts():
+    """Lista os layouts treinados."""
+    import ver_layouts
+
+    _titulo("LAYOUTS TREINADOS")
+
+    entradas = ver_layouts._carregar()
+
+    if not entradas:
+        print("\n  Nenhum layout treinado ainda.")
+        print("  Os layouts são gravados quando o pdf_reader extrai campos")
+        print("  com rótulo identificado.")
+        return
+
+    print()
+    print(f"  {ver_layouts._resumo(entradas)}")
+    print()
+
+    for e in entradas:
+        print(ver_layouts._formatar(e))
+
+
+# ---------------------------------------------------------------------------
+# MENU: RESOLVER REVISÃO MANUAL
+# ---------------------------------------------------------------------------
+
+
+def menu_resolver_revisao():
+    """Permite decidir o destino de registros em revisão."""
+    import resolver_revisao as rr
+
+    _titulo("RESOLVER REVISÃO MANUAL")
+
+    registros = rr.listar_em_revisao()
+
+    if not registros:
+        print("\n  Nenhum registro em revisão. Tudo conciliado.")
+        return
+
+    print(f"\n  {len(registros)} registro(s) precisam de decisão:\n")
+    for i, r in enumerate(registros, 1):
+        print(rr._formatar(r, i))
+
+    print()
+    print("  Ações disponíveis:")
+    print("    C = Conferir (aceitar como correto)")
+    print("    M = Manter em revisão (não decide agora)")
+    print("    D = Marcar como duplicado")
+    print()
+
+    entrada = input("  Número do registro (Enter = cancelar): ").strip()
+    if not entrada.isdigit():
+        print("\n  Cancelado.")
+        return
+
+    idx = int(entrada) - 1
+    if not (0 <= idx < len(registros)):
+        print("\n  Número inválido.")
+        return
+
+    alvo = registros[idx]
+
+    acao = input("  Ação (C/M/D): ").strip().upper()
+    mapa = {"C": "CONFERIR", "M": "MANTER", "D": "DUPLICADO"}
+    if acao not in mapa:
+        print("\n  Ação inválida. Cancelado.")
+        return
+
+    obs = input("  Observação (opcional, Enter = padrão): ").strip()
+
+    if not _pedir_confirmacao(f"  Aplicar {mapa[acao]} em {alvo['numero_remessa']}?"):
+        print("\n  Cancelado. Nada foi alterado.")
+        return
+
+    resultado = rr.aplicar_decisao(alvo["numero_remessa"], mapa[acao], obs)
+
+    if resultado.get("ok"):
+        print(f"\n  OK: {resultado['remessa']}")
+        print(f"  {resultado['status_anterior']} -> {resultado['status_novo']}")
+    else:
+        print(f"\n  ERRO: {resultado.get('motivo')}")
+
+
+# ---------------------------------------------------------------------------
 # MENU PRINCIPAL
 # ---------------------------------------------------------------------------
 
@@ -424,7 +588,11 @@ def menu_principal():
         print("  3. Dashboard de acompanhamento")
         print("  4. Exportar para Excel")
         print("  5. Ver estatísticas do banco")
-        print("  6. Sair\n")
+        print("  6. Ver fila de treinamento")
+        print("  7. Resolver itens da fila")
+        print("  8. Ver layouts treinados")
+        print("  9. Resolver revisão manual")
+        print(" 10. Sair\n")
 
         opcao = input("  Escolha uma opção: ").strip()
 
@@ -439,6 +607,14 @@ def menu_principal():
         elif opcao == "5":
             menu_estatisticas()
         elif opcao == "6":
+            menu_ver_fila()
+        elif opcao == "7":
+            menu_resolver_fila()
+        elif opcao == "8":
+            menu_ver_layouts()
+        elif opcao == "9":
+            menu_resolver_revisao()
+        elif opcao == "10":
             print("\n  Até logo.")
             break
         else:
