@@ -572,6 +572,127 @@ def menu_resolver_revisao():
 
 
 # ---------------------------------------------------------------------------
+# MENU: REPROCESSAR
+# ---------------------------------------------------------------------------
+
+
+def menu_reprocessar():
+    """Reprocessa remessas específicas."""
+    import reprocessar as rp
+
+    _titulo("REPROCESSAR REMESSAS")
+
+    registros = rp.listar_reprocessaveis()
+    print()
+
+    if not _pedir_confirmacao("  Confirma o reprocessamento?"):
+        print("\n  Cancelado.")
+        return
+
+    import backup as bk
+
+    bk.criar_backup("reprocessar")
+
+    numeros = [r["numero_remessa"] for r in alvos]
+    resultado = rp.reprocessar_lote(numeros)
+    if not registros:
+        print("\n  Nenhuma remessa em status reprocessável.")
+        print("  (Só entram aqui: revisão, divergências e aguardando reembolso.)")
+        return
+
+    print(f"\n  {len(registros)} remessa(s) reprocessável(is):\n")
+    for i, r in enumerate(registros, 1):
+        print(
+            f"    {i:>2}. {r['numero_remessa']:<20} "
+            f"{r.get('status'):<24} score {r.get('score') or 0}"
+        )
+
+    print()
+    print("  Digite os números separados por espaço (ex: 1 3 5)")
+    print("  Ou 'T' para reprocessar todas")
+    entrada = input("  Escolha (Enter = cancelar): ").strip()
+
+    if not entrada:
+        print("\n  Cancelado.")
+        return
+
+    if entrada.upper() == "T":
+        alvos = registros
+    else:
+        try:
+            indices = [int(x) - 1 for x in entrada.split()]
+        except ValueError:
+            print("\n  ERRO: use apenas números separados por espaço.")
+            return
+
+        alvos = [registros[i] for i in indices if 0 <= i < len(registros)]
+        if not alvos:
+            print("\n  Nenhum número válido.")
+            return
+
+    print(f"\n  Serão reprocessadas {len(alvos)} remessa(s):")
+    for r in alvos:
+        print(f"    {r['numero_remessa']}")
+
+    print()
+    if not _pedir_confirmacao("  Confirma o reprocessamento?"):
+        print("\n  Cancelado.")
+        return
+
+    numeros = [r["numero_remessa"] for r in alvos]
+    resultado = rp.reprocessar_lote(numeros)
+
+    print(f"\n  Processadas: {resultado['processadas']}")
+    print(f"  Falhas:      {resultado['falhas']}")
+    print("\n  Detalhe:")
+    for r in resultado["resultados"]:
+        if r.get("ok"):
+            print(
+                f"    {r['remessa']:<20} {str(r.get('status')):<24} "
+                f"score {r.get('score')}"
+            )
+        else:
+            print(f"    {r['remessa']:<20} ERRO: {r.get('motivo')}")
+
+
+# ---------------------------------------------------------------------------
+# MENU: BACKUP
+# ---------------------------------------------------------------------------
+
+
+def menu_backup():
+    """Gerencia os backups do banco."""
+    import backup as bk
+
+    _titulo("BACKUP DO BANCO")
+
+    backups = bk.listar_backups()
+
+    if backups:
+        print(f"\n  {len(backups)} backup(s) existente(s):\n")
+        for b in backups:
+            print(f"    {b['nome']:<45} {b['tamanho_kb']:>7} KB  {b['modificado']}")
+    else:
+        print("\n  Nenhum backup ainda.")
+
+    print()
+    print("  B = Criar backup agora")
+    print("  Enter = voltar")
+
+    escolha = input("  Escolha: ").strip().upper()
+
+    if escolha != "B":
+        return
+
+    resultado = bk.criar_backup("manual")
+
+    if resultado.get("ok"):
+        print(f"\n  OK: {resultado['nome']} ({resultado['tamanho_kb']} KB)")
+    else:
+        print(f"\n  ERRO: {resultado.get('motivo')}")
+
+
+# ---------------------------------------------------------------------------
 # MENU PRINCIPAL
 # ---------------------------------------------------------------------------
 
@@ -592,8 +713,9 @@ def menu_principal():
         print("  7. Resolver itens da fila")
         print("  8. Ver layouts treinados")
         print("  9. Resolver revisão manual")
-        print(" 10. Sair\n")
-
+        print(" 10. Reprocessar remessas")
+        print(" 11. Backup do banco")
+        print(" 12. Sair\n")
         opcao = input("  Escolha uma opção: ").strip()
 
         if opcao == "1":
@@ -615,6 +737,10 @@ def menu_principal():
         elif opcao == "9":
             menu_resolver_revisao()
         elif opcao == "10":
+            menu_reprocessar()
+        elif opcao == "11":
+            menu_backup()
+        elif opcao == "12":
             print("\n  Até logo.")
             break
         else:

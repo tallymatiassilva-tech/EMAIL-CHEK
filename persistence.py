@@ -188,9 +188,9 @@ def salvar_quitacao_agrupada(resultado: dict) -> dict:
         with cursor() as cur:
             cur.execute(
                 """UPDATE reembolsos
-                   SET status=?, data_atualizacao=?
+                   SET status=?, score=?, data_atualizacao=?
                    WHERE numero_remessa=?""",
-                (Status.CONFERIDO, _agora(), str(remessa)),
+                (Status.CONFERIDO, 100, _agora(), str(remessa)),
             )
             cur.execute(
                 """INSERT INTO historico_conciliacao
