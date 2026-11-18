@@ -2,6 +2,10 @@
 
 Mostra o panorama atual: quantos reembolsos em cada status, quais estão
 vencendo, quais precisam de revisão e o tempo médio de reembolso.
+
+Divergências incluem tanto os status críticos quanto qualquer remessa com
+CNPJ divergente entre guia e comprovante, mesmo que o status final tenha
+sido outro.
 """
 
 from datetime import datetime, timedelta
@@ -41,6 +45,17 @@ def _barra(qtd: int, total: int, largura: int = 30) -> str:
     return "█" * int(round((qtd / total) * largura))
 
 
+def _e_divergente_cnpj(registro: dict) -> bool:
+    """Remessa com CNPJ divergente entre guia e comprovante."""
+    return registro.get("cnpj_divergente") in (True, 1, "True")
+
+
+def _cnpj_nao_lido(registro: dict) -> bool:
+    """Remessa onde o CNPJ nao foi extraido em um dos documentos."""
+    valor = registro.get("cnpj_divergente")
+    return valor is None or valor == ""
+
+
 def mostrar_dashboard():
     """Exibe o dashboard completo no terminal."""
     registros = db.listar()
@@ -71,12 +86,17 @@ def mostrar_dashboard():
     criticos = sum(por_status.get(s, 0) for s in STATUS_CRITICOS)
     aguardando = por_status.get(Status.AGUARDANDO, 0)
 
+    div_cnpj = sum(1 for r in registros if _e_divergente_cnpj(r))
+    nao_lido = sum(1 for r in registros if _cnpj_nao_lido(r))
+
     print(f"\n  Total de reembolsos:       {total}")
     print(
         f"  Conferidos:                {conferidos} ({conferidos / total * 100:.1f}%)"
     )
     print(f"  Precisam de revisão:       {criticos} ({criticos / total * 100:.1f}%)")
     print(f"  Aguardando comprovante:    {aguardando}")
+    print(f"  CNPJ divergente:           {div_cnpj}")
+    print(f"  CNPJ não lido:             {nao_lido}")
 
     dias = [r["dias_reembolso"] for r in registros if r.get("dias_reembolso")]
     if dias:
@@ -116,21 +136,28 @@ def mostrar_dashboard():
             )
 
     # ------------------------------------------------------------------
-    # 4. TOP DIVERGÊNCIAS
+    # 4. DIVERGÊNCIAS PARA REVISÃO
+    # Inclui os status críticos E qualquer remessa com CNPJ divergente,
+    # mesmo que o status final tenha sido outro.
     # ------------------------------------------------------------------
     _titulo("DIVERGÊNCIAS PARA REVISÃO")
 
-    divergentes = [r for r in registros if r.get("status") in STATUS_CRITICOS]
+    divergentes = [
+        r
+        for r in registros
+        if r.get("status") in STATUS_CRITICOS or _e_divergente_cnpj(r)
+    ]
     if not divergentes:
         print("\n  Nenhuma divergência pendente.")
     else:
         divergentes.sort(key=lambda r: r.get("valor_guia") or 0, reverse=True)
         print()
         for r in divergentes[:15]:
+            marca = "CNPJ" if _e_divergente_cnpj(r) else ""
             print(
                 f"  {r['numero_remessa']:<18} {r['status']:<20} "
                 f"R$ {r.get('valor_guia') or 0:>10.2f}  "
-                f"{r.get('cliente') or 'sem cliente'}"
+                f"{(r.get('cliente') or 'sem cliente'):<28} {marca}"
             )
         if len(divergentes) > 15:
             print(f"  ... e mais {len(divergentes) - 15} divergências")

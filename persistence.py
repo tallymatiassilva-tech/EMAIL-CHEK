@@ -7,7 +7,7 @@ de status na tabela historico_conciliacao para auditoria.
 from datetime import datetime
 
 from config import Status
-from database import buscar_por_remessa, cursor, listar_pendentes_por_cnpj
+from database import buscar_por_remessa, cursor
 from log_manager import get_logger
 
 log = get_logger("persistence")
@@ -71,6 +71,11 @@ def _motivo(resultado: dict, lado_cliente: dict) -> str | None:
     )
 
 
+def _e_divergente_cnpj(resultado: dict) -> bool:
+    """Remessa com CNPJ divergente entre guia e comprovante."""
+    return resultado.get("cnpj_divergente") in (True, 1, "True")
+
+
 # ---------------------------------------------------------------------------
 # GRAVAÇÃO DO RESULTADO
 # ---------------------------------------------------------------------------
@@ -126,15 +131,23 @@ def salvar_resultado(resultado: dict) -> dict:
     if lado_cliente.get("valor_comprovante") and not valor_quitado:
         campos["valor_reembolso_cliente"] = lado_cliente["valor_comprovante"]
 
-    # Campos de CNPJ, quando o pipeline os enviou
-    for campo_cnpj in (
-        "cnpj_guia",
-        "cnpj_comprovante",
-        "cnpj_divergente",
-        "motivo_cnpj",
-    ):
+    # Campos de CNPJ. Quando o resultado traz a chave, usa o valor. Quando
+    # não traz, preserva o que já está no banco — exceto cnpj_divergente,
+    # que precisa ser recalculado a cada execução para não ficar travado
+    # em 1 depois que a divergência foi resolvida.
+    for campo_cnpj in ("cnpj_guia", "cnpj_comprovante", "motivo_cnpj"):
         if campo_cnpj in resultado:
             campos[campo_cnpj] = resultado[campo_cnpj]
+
+    if "cnpj_divergente" in resultado:
+        campos["cnpj_divergente"] = (
+            1 if resultado["cnpj_divergente"] in (True, 1, "True") else 0
+        )
+    elif status_novo != Status.DIV_CNPJ:
+        # Sem divergência de CNPJ no status final e sem a chave no resultado:
+        # limpa o indicador para não deixar a remessa presa na lista de
+        # divergências depois que o problema foi resolvido.
+        campos["cnpj_divergente"] = 0
 
     sets = ",".join(f"{k}=?" for k in campos)
     with cursor() as cur:
@@ -193,10 +206,20 @@ def salvar_resultado(resultado: dict) -> dict:
 def salvar_quitacao_agrupada(resultado: dict) -> dict:
     """Quando um comprovante quita N reembolsos, atualiza todos de uma vez.
 
-    Remessas com CNPJ divergente NUNCA entram aqui: o pipeline as desvia
-    para salvar_resultado, que respeita o status DIVERGENCIA_CNPJ.
+    Remessas com CNPJ divergente NUNCA entram aqui: o agrupamento quitaria
+    vários reembolsos de uma vez, e a divergência de identificação precisa
+    de revisão humana antes disso. A proteção fica aqui também, não só no
+    pipeline, para cobrir chamadas diretas de outros módulos.
     """
     _garantir_historico()
+
+    # Defesa em profundidade: divergência de CNPJ nunca agrupa
+    if _e_divergente_cnpj(resultado):
+        log.warning(
+            "Remessa %s com CNPJ divergente — desviada para salvar_resultado",
+            resultado.get("numero_remessa"),
+        )
+        return salvar_resultado(resultado)
 
     lado_cliente = resultado.get("lado_cliente") or {}
     quitados = lado_cliente.get("quitados") or []
@@ -205,12 +228,26 @@ def salvar_quitacao_agrupada(resultado: dict) -> dict:
         return salvar_resultado(resultado)
 
     alterados = []
+    ignorados = []
+
     for item in quitados:
-        remessa = item.get("numero_remessa") or item.get("id")
+        # numero_remessa é o identificador de negócio. O id numérico da
+        # tabela NÃO serve aqui: buscar_por_remessa espera o número da
+        # remessa, não o id.
+        remessa = item.get("numero_remessa")
         if not remessa:
+            ignorados.append(item.get("id"))
+            log.warning(
+                "Item quitado sem numero_remessa (id=%s) — ignorado",
+                item.get("id"),
+            )
             continue
-        atual = buscar_por_remessa(str(remessa))
+
+        remessa = str(remessa)
+        atual = buscar_por_remessa(remessa)
         if not atual:
+            ignorados.append(remessa)
+            log.warning("Remessa %s do agrupamento não encontrada", remessa)
             continue
 
         status_anterior = atual.get("status")
@@ -219,7 +256,7 @@ def salvar_quitacao_agrupada(resultado: dict) -> dict:
                 """UPDATE reembolsos
                    SET status=?, score=?, data_atualizacao=?
                    WHERE numero_remessa=?""",
-                (Status.CONFERIDO, 100, _agora(), str(remessa)),
+                (Status.CONFERIDO, 100, _agora(), remessa),
             )
             cur.execute(
                 """INSERT INTO historico_conciliacao
@@ -228,7 +265,7 @@ def salvar_quitacao_agrupada(resultado: dict) -> dict:
                     valor_quitado, diferenca, motivo, criado_em)
                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    str(remessa),
+                    remessa,
                     status_anterior,
                     Status.CONFERIDO,
                     atual.get("score") or 0,
@@ -240,10 +277,19 @@ def salvar_quitacao_agrupada(resultado: dict) -> dict:
                     _agora(),
                 ),
             )
-        alterados.append(str(remessa))
+        alterados.append(remessa)
 
-    log.info("Quitação agrupada: %d reembolsos atualizados", len(alterados))
-    return {"ok": True, "alterado": bool(alterados), "quitados": alterados}
+    log.info(
+        "Quitação agrupada: %d reembolsos atualizados, %d ignorados",
+        len(alterados),
+        len(ignorados),
+    )
+    return {
+        "ok": True,
+        "alterado": bool(alterados),
+        "quitados": alterados,
+        "ignorados": ignorados,
+    }
 
 
 # ---------------------------------------------------------------------------

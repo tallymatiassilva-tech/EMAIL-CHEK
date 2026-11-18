@@ -4,10 +4,10 @@ Fluxo por remessa:
 1. Garante o banco inicializado (tabelas criadas)
 2. Lista os arquivos da pasta da remessa
 3. Descarta imagens embutidas (assinaturas e logos do e-mail)
-4. Classifica cada arquivo por conteúdo
+4. Classifica cada arquivo por conteúdo (com consulta ao cache de layout)
 5. Extrai os campos conforme o tipo
-6. Registra falhas de extração na fila de treinamento
-7. Compara o CNPJ da guia com o do comprovante do cliente
+6. Grava o layout aprendido quando a extração foi bem-sucedida
+7. Registra falhas de extração na fila de treinamento
 8. Grava no banco (upsert_reembolso)
 9. Busca pendentes do cliente por CNPJ
 10. Concilia com o motor
@@ -19,6 +19,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import database as db
+import layout_cache
 import persistence as ps
 from conciliation_engine import conciliar_remessa
 from config import TipoDoc
@@ -59,6 +60,11 @@ PREFIXOS_IMAGEM_EMBUTIDA = (
 # Imagens abaixo deste tamanho são tratadas como assinatura/logo
 LIMITE_BYTES_IMAGEM_EMBUTIDA = 50_000
 
+# Confiança mínima para gravar o layout aprendido. Abaixo disso, o
+# documento pode ter sido classificado errado e o layout contaminaria
+# o cache com um mapa ruim.
+CONFIANCA_MINIMA_LAYOUT = 60.0
+
 # Campos obrigatórios por tipo de documento. Se algum faltar, o documento
 # vai para a fila de treinamento para você criar um layout específico.
 CAMPOS_OBRIGATORIOS = {
@@ -88,67 +94,120 @@ def _e_imagem_embutida(caminho: Path) -> bool:
     """
     if caminho.suffix.lower() not in EXT_IMAGEM:
         return False
+
     nome = caminho.stem.lower()
     if any(nome.startswith(p) or nome == p for p in PREFIXOS_IMAGEM_EMBUTIDA):
         return True
+
     try:
         if caminho.stat().st_size < LIMITE_BYTES_IMAGEM_EMBUTIDA:
             return True
     except OSError:
         pass
+
     return False
 
 
 def _calcular_dias_reembolso(
     data_pagamento: str | None, data_reembolso: str | None
 ) -> int | None:
-    """Diferença em dias entre o pagamento da Jadlog e o reembolso do cliente."""
+    """Diferença em dias entre o pagamento da Jadlog e o reembolso do cliente.
+
+    Aceita data em dd/mm/yyyy (formato do pdf_reader) e em YYYY-MM-DD.
+    """
     if not data_pagamento or not data_reembolso:
         return None
-    try:
-        dj = date.fromisoformat(str(data_pagamento)[:10])
-        dc = date.fromisoformat(str(data_reembolso)[:10])
-        return (dc - dj).days
-    except (ValueError, TypeError):
+
+    def _parse(valor: str) -> date | None:
+        s = str(valor)[:10]
+        # dd/mm/yyyy
+        if "/" in s:
+            try:
+                d, m, a = s.split("/")
+                return date(int(a), int(m), int(d))
+            except (ValueError, TypeError):
+                return None
+        # YYYY-MM-DD
+        try:
+            return date.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+
+    dj = _parse(data_pagamento)
+    dc = _parse(data_reembolso)
+    if dj is None or dc is None:
         return None
+    return (dc - dj).days
 
 
 # ---------------------------------------------------------------------------
-# COMPARACAO DE CNPJ
+# APRENDIZADO DE LAYOUT
 # ---------------------------------------------------------------------------
 
 
-def comparar_cnpjs(cnpj_guia: str, cnpj_comprovante: str) -> dict:
-    """Compara o CNPJ da guia com o do comprovante do cliente.
+def _rotulos_do_campo(campos: dict) -> dict:
+    """Extrai o mapa campo -> rótulo que o extrator devolveu.
 
-    Retorna cnpj_divergente = True (diferentes), False (iguais)
-    ou None (um dos dois nao foi lido).
+    O pdf_reader devolve os rótulos usados na chave `_rotulos`. Se a
+    chave não existir, devolve vazio e o layout não é gravado.
     """
-    g = (cnpj_guia or "").strip()
-    c = (cnpj_comprovante or "").strip()
+    rotulos = campos.get("_rotulos")
+    if isinstance(rotulos, dict):
+        return rotulos
+    return {}
 
-    if not g or not c:
-        return {
-            "cnpj_guia": g,
-            "cnpj_comprovante": c,
-            "cnpj_divergente": None,
-            "motivo_cnpj": "CNPJ nao extraido em um dos documentos",
-        }
 
-    if g == c:
-        return {
-            "cnpj_guia": g,
-            "cnpj_comprovante": c,
-            "cnpj_divergente": False,
-            "motivo_cnpj": "CNPJ confere",
-        }
+def _aprender_layout(
+    caminho: Path, tipo: str, confianca: float, campos: dict, texto: str | None
+) -> bool:
+    """Grava o layout aprendido quando a extração foi bem-sucedida.
 
-    return {
-        "cnpj_guia": g,
-        "cnpj_comprovante": c,
-        "cnpj_divergente": True,
-        "motivo_cnpj": f"CNPJ divergente: guia {g} x comprovante {c}",
-    }
+    Condições para gravar:
+    1. O tipo foi identificado com confiança >= CONFIANCA_MINIMA_LAYOUT
+    2. A extração devolveu pelo menos um rótulo usado
+    3. O texto do documento está disponível para o hash
+
+    Retorna True quando gravou.
+    """
+    if confianca < CONFIANCA_MINIMA_LAYOUT:
+        log.debug(
+            "Layout não gravado: confiança %.1f abaixo do mínimo (%.0f)",
+            confianca,
+            CONFIANCA_MINIMA_LAYOUT,
+        )
+        return False
+
+    rotulos = _rotulos_do_campo(campos)
+    if not rotulos:
+        log.debug("Layout não gravado: extrator não devolveu rótulos")
+        return False
+
+    # O texto vem do próprio extrator; se não veio, lê do arquivo
+    if texto is None:
+        try:
+            from ocr_engine import extrair_texto
+
+            texto = extrair_texto(caminho)
+        except Exception as e:
+            log.debug("Layout não gravado: texto indisponível (%s)", e)
+            return False
+
+    if not texto:
+        return False
+
+    try:
+        layout_cache.gravar_layout(tipo, texto, campos, rotulos)
+        log.info(
+            "Layout aprendido: %s (%s, %d rótulos)",
+            caminho.name,
+            tipo,
+            len(rotulos),
+        )
+        return True
+    except Exception as e:
+        # O aprendizado nunca deve derrubar o pipeline
+        log.error("Erro ao gravar layout de %s: %s", caminho.name, e)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +238,7 @@ def _registrar_falha(
         },
         "texto": texto,
     }
+
     try:
         with db.cursor() as cur:
             cur.execute(
@@ -189,6 +249,7 @@ def _registrar_falha(
             if cur.fetchone():
                 log.debug("Falha já registrada: %s", caminho.name)
                 return
+
             cur.execute(
                 """INSERT INTO fila_treinamento
                    (tipo_documento, caminho_arquivo, numero_remessa,
@@ -236,6 +297,7 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
     desconhecidos = []
     ignorados = []
     enfileirados = []
+    layouts_aprendidos = []
 
     # Classifica e extrai cada arquivo
     for arq in arquivos:
@@ -259,6 +321,13 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
             campos = extrair_por_tipo(arq, tipo)
             campos["numero_remessa"] = remessa  # o motor espera este campo
             campos["caminho"] = str(arq)
+            campos["confianca"] = conf
+
+            # Aprendizado de layout: grava o mapa de rótulos que funcionou.
+            # Roda antes da checagem de campos faltantes, porque um layout
+            # parcial ainda ajuda na próxima vez.
+            if _aprender_layout(arq, tipo, conf, campos, campos.get("texto")):
+                layouts_aprendidos.append(arq.name)
 
             # Etapa 4: registra falhas de extração para treinamento futuro
             faltando = _campos_faltantes(tipo, campos)
@@ -281,6 +350,7 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
                     comp_cliente = campos
                 else:
                     log.info("Comprovante cliente adicional ignorado: %s", arq.name)
+
         except Exception as e:
             log.warning("Erro ao processar %s: %s", arq.name, e)
             desconhecidos.append(arq.name)
@@ -294,32 +364,18 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
             "desconhecidos": desconhecidos,
             "ignorados": ignorados,
             "enfileirados": enfileirados,
+            "layouts_aprendidos": layouts_aprendidos,
         }
-
-    # ------------------------------------------------------------------
-    # Comparacao de CNPJ: guia x comprovante do cliente
-    # ------------------------------------------------------------------
-    cnpj_guia = (guia.get("cnpj") or "").strip()
-    cnpj_comprovante = (
-        (comp_cliente.get("cnpj_pagador") or "").strip() if comp_cliente else ""
-    )
-    comparacao = comparar_cnpjs(cnpj_guia, cnpj_comprovante)
-
-    if comparacao["cnpj_divergente"] is True:
-        log.warning("Remessa %s: %s", remessa, comparacao["motivo_cnpj"])
 
     # Monta o registro para o banco (só colunas que existem no schema)
     registro = {
         "numero_remessa": remessa,
         "numero_nf": guia.get("numero_nf") or None,
-        "tomador": guia.get("tomador") or guia.get("cliente") or None,
+        "tomador": guia.get("tomador") or None,
         "numero_guia": guia.get("numero_guia") or None,
         "cliente": guia.get("cliente") or None,
         "cnpj_cliente": guia.get("cnpj") or None,
-        "cnpj_guia": comparacao["cnpj_guia"] or None,
-        "cnpj_comprovante": comparacao["cnpj_comprovante"] or None,
-        "cnpj_divergente": comparacao["cnpj_divergente"],
-        "motivo_cnpj": comparacao["motivo_cnpj"],
+        "cnpj_guia": guia.get("cnpj") or None,
         "uf": guia.get("uf") or None,
         "tributo": guia.get("tributo") or None,
         "valor_guia": guia.get("valor_guia"),
@@ -345,6 +401,7 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
         registro["valor_reembolso_cliente"] = comp_cliente.get("valor_reembolso")
         registro["data_reembolso_cliente"] = comp_cliente.get("data_reembolso")
         registro["caminho_comp_cliente"] = comp_cliente.get("caminho")
+        registro["cnpj_comprovante"] = comp_cliente.get("cnpj_pagador") or None
 
     # Calcula o prazo de reembolso (usado pelo dashboard e pela exportação)
     registro["dias_reembolso"] = _calcular_dias_reembolso(
@@ -364,35 +421,11 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
     resultado = conciliar_remessa(guia, comp_jadlog, comp_cliente, pendentes)
     resultado["numero_remessa"] = remessa
 
-    # ------------------------------------------------------------------
-    # CNPJ divergente tem prioridade sobre qualquer outro status:
-    # é um erro de identificação do pagador, mais grave que diferença
-    # de valor. Quando um dos CNPJs não foi lido, não dá para confirmar
-    # nem negar — cai para revisão manual.
-    # ------------------------------------------------------------------
-    resultado["cnpj_guia"] = comparacao["cnpj_guia"]
-    resultado["cnpj_comprovante"] = comparacao["cnpj_comprovante"]
-    resultado["cnpj_divergente"] = comparacao["cnpj_divergente"]
-    resultado["motivo_cnpj"] = comparacao["motivo_cnpj"]
-
-    if comparacao["cnpj_divergente"] is True:
-        resultado["status_final"] = "DIVERGENCIA_CNPJ"
-        resultado["score_final"] = 0
-    elif (
-        comparacao["cnpj_divergente"] is None
-        and resultado.get("status_final") == "CONFERIDO"
-    ):
-        resultado["status_final"] = "REVISAO_MANUAL"
-
-    # ------------------------------------------------------------------
-    # Persiste.
-    # A quitação agrupada força CONFERIDO em todos os quitados — o que
-    # mascararia a divergência de CNPJ. Por isso, remessa com CNPJ
-    # divergente sempre passa pelo salvar_resultado, que respeita o
-    # status_final sobrescrito acima.
-    # ------------------------------------------------------------------
+    # Persiste. Uma remessa com CNPJ divergente NUNCA entra no caminho
+    # agrupado: o agrupamento quitaria vários reembolsos de uma vez, e a
+    # divergência de identificação precisa de revisão humana antes disso.
+    cnpj_divergente = bool(resultado.get("cnpj_divergente"))
     tem_quitacao_agrupada = bool((resultado.get("lado_cliente") or {}).get("quitados"))
-    cnpj_divergente = comparacao["cnpj_divergente"] is True
 
     if tem_quitacao_agrupada and not cnpj_divergente:
         ps.salvar_quitacao_agrupada(resultado)
@@ -404,7 +437,6 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
         "remessa": remessa,
         "status": resultado.get("status_final"),
         "score": resultado.get("score_final"),
-        "cnpj_divergente": comparacao["cnpj_divergente"],
         "guia": bool(guia),
         "comp_jadlog": bool(comp_jadlog),
         "comp_cliente": bool(comp_cliente),
@@ -412,6 +444,7 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
         "desconhecidos": desconhecidos,
         "ignorados": ignorados,
         "enfileirados": enfileirados,
+        "layouts_aprendidos": layouts_aprendidos,
         "resultado": resultado,
     }
 
@@ -443,10 +476,13 @@ def processar_pasta_raiz(pasta_raiz: str | Path) -> dict:
             resultados.append({"ok": False, "remessa": sub.name, "motivo": str(e)})
 
     ok = sum(1 for r in resultados if r.get("ok"))
+    total_layouts = sum(len(r.get("layouts_aprendidos") or []) for r in resultados)
+
     return {
         "ok": True,
         "total": len(resultados),
         "processadas": ok,
         "falhas": len(resultados) - ok,
+        "layouts_aprendidos": total_layouts,
         "resultados": resultados,
     }

@@ -1,12 +1,16 @@
-"""Exportação dos reembolsos conciliados para Excel.
+"""Exportacao dos reembolsos conciliados para Excel.
 
 Gera um arquivo .xlsx com:
 - Aba "Reembolsos": todos os registros com status, score e valores
-- Aba "Divergências": status críticos + qualquer CNPJ divergente
-- Aba "Resumo": contagens por status, por camada e de CNPJ
+- Aba "Divergencias": apenas os que precisam de revisao
+- Aba "Resumo": contagens por status e por camada
 
-Colunas novas: tomador (logo após NF), cnpj_guia, cnpj_comprovante
+Colunas novas: tomador (logo apos NF), cnpj_guia, cnpj_comprovante
 e cnpj_divergente.
+
+DATAS: o pdf_reader devolve dd/mm/yyyy. A exportacao converte para
+datetime e aplica number_format dd/mm/yyyy, para o Excel tratar como
+data de verdade (ordenavel, filtravel) e nao como texto.
 """
 
 from datetime import datetime
@@ -19,7 +23,6 @@ from log_manager import get_logger
 
 log = get_logger("export")
 
-# Status que exigem ação humana
 STATUS_CRITICOS = {
     Status.DIV_VALOR,
     Status.DIV_CNPJ,
@@ -29,7 +32,6 @@ STATUS_CRITICOS = {
     Status.AGRUPADO,
 }
 
-# Ordem de exibição das colunas
 COLUNAS = [
     ("numero_remessa", "Remessa", 16),
     ("numero_nf", "NF", 12),
@@ -43,7 +45,7 @@ COLUNAS = [
     ("uf", "UF", 6),
     ("tributo", "Tributo", 12),
     ("valor_guia", "Valor Guia", 14),
-    ("data_emissao", "Emissão", 12),
+    ("data_emissao", "Emissao", 12),
     ("data_vencimento", "Vencimento", 12),
     ("valor_pago_jadlog", "Pago Jadlog", 14),
     ("data_pagamento_jadlog", "Data Pgto Jadlog", 16),
@@ -55,7 +57,15 @@ COLUNAS = [
     ("data_atualizacao", "Atualizado em", 20),
 ]
 
-# Tradução do indicador de divergência de CNPJ
+# Colunas que contem data (recebem number_format dd/mm/yyyy)
+COLUNAS_DATA = {
+    "data_emissao",
+    "data_vencimento",
+    "data_pagamento_jadlog",
+    "data_reembolso_cliente",
+    "data_atualizacao",
+}
+
 MAPA_DIVERGENCIA = {
     True: "SIM",
     False: "NAO",
@@ -68,8 +78,39 @@ MAPA_DIVERGENCIA = {
 }
 
 
+def _parse_data(valor) -> datetime | None:
+    """Converte uma data em datetime para o Excel.
+
+    Aceita:
+    - dd/mm/yyyy (formato do pdf_reader)
+    - YYYY-MM-DD (formato ISO)
+    - datetime (ja convertido)
+    """
+    if valor is None or valor == "":
+        return None
+
+    if isinstance(valor, datetime):
+        return valor
+
+    s = str(valor).strip()[:10]
+
+    # dd/mm/yyyy
+    if "/" in s:
+        try:
+            d, m, a = s.split("/")
+            return datetime(int(a), int(m), int(d))
+        except (ValueError, TypeError):
+            return None
+
+    # YYYY-MM-DD
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
 def _valor_celula(registro: dict, campo: str):
-    """Extrai o valor de um campo, tratando o indicador de divergência."""
+    """Extrai o valor de um campo, tratando o indicador de divergencia."""
     valor = registro.get(campo)
 
     if campo == "cnpj_divergente":
@@ -77,16 +118,17 @@ def _valor_celula(registro: dict, campo: str):
             return "NAO LIDO"
         return MAPA_DIVERGENCIA.get(valor, "NAO LIDO")
 
+    if campo in COLUNAS_DATA:
+        return _parse_data(valor)
+
     return valor if valor is not None else ""
 
 
 def _linhas_para_excel(registros: list[dict]) -> list[list]:
-    """Converte os registros do banco em linhas de planilha."""
     return [[_valor_celula(r, campo) for campo, _, _ in COLUNAS] for r in registros]
 
 
 def _escrever_cabecalho(ws, cor: str):
-    """Escreve o cabeçalho formatado na primeira linha."""
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
@@ -99,7 +141,6 @@ def _escrever_cabecalho(ws, cor: str):
 
 
 def _escrever_dados(ws, registros: list[dict]):
-    """Escreve as linhas de dados com formatação de valor."""
     from openpyxl.styles import Alignment, PatternFill
 
     vermelho = PatternFill("solid", fgColor="FFC7CE")
@@ -111,6 +152,10 @@ def _escrever_dados(ws, registros: list[dict]):
 
             if campo.startswith("valor_"):
                 cell.number_format = "R$ #,##0.00"
+            elif campo in COLUNAS_DATA:
+                # Data como datetime: Excel trata como data de verdade
+                cell.number_format = "dd/mm/yyyy"
+                cell.alignment = Alignment(horizontal="center")
             elif campo == "score":
                 cell.alignment = Alignment(horizontal="center")
             elif campo == "cnpj_divergente":
@@ -119,40 +164,7 @@ def _escrever_dados(ws, registros: list[dict]):
                     cell.fill = vermelho
 
 
-def _e_divergente(registro: dict) -> bool:
-    """Remessa que precisa de atencao: status critico OU CNPJ divergente."""
-    if registro.get("status") in STATUS_CRITICOS:
-        return True
-    return registro.get("cnpj_divergente") in (True, 1, "True")
-
-
-def _contar_cnpj(registros: list[dict]) -> tuple[int, int]:
-    """Conta CNPJ divergente e nao lido.
-
-    Usa as funcoes do database quando disponiveis; cai para contagem
-    em memoria se a consulta falhar.
-    """
-    try:
-        return len(db.listar_divergencias_cnpj()), len(db.listar_cnpj_nao_lido())
-    except Exception:
-        div = len(
-            [r for r in registros if r.get("cnpj_divergente") in (True, 1, "True")]
-        )
-        nao_lido = len(
-            [
-                r
-                for r in registros
-                if r.get("cnpj_divergente") is None or r.get("cnpj_divergente") == ""
-            ]
-        )
-        return div, nao_lido
-
-
 def exportar(caminho_destino: str | Path | None = None) -> Path:
-    """Exporta todos os reembolsos para um arquivo Excel.
-
-    Retorna o caminho do arquivo gerado.
-    """
     from openpyxl import Workbook
     from openpyxl.styles import Font
 
@@ -170,9 +182,7 @@ def exportar(caminho_destino: str | Path | None = None) -> Path:
 
     wb = Workbook()
 
-    # ------------------------------------------------------------------
     # ABA 1: REEMBOLSOS
-    # ------------------------------------------------------------------
     ws = wb.active
     ws.title = "Reembolsos"
     _escrever_cabecalho(ws, "1F4E78")
@@ -180,41 +190,42 @@ def exportar(caminho_destino: str | Path | None = None) -> Path:
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
-    # ------------------------------------------------------------------
-    # ABA 2: DIVERGÊNCIAS
-    # Inclui os status críticos E qualquer remessa com CNPJ divergente,
-    # mesmo que o status final tenha sido outro.
-    # ------------------------------------------------------------------
-    criticos = [r for r in registros if _e_divergente(r)]
-    ws2 = wb.create_sheet("Divergências")
+    # ABA 2: DIVERGENCIAS
+    criticos = [r for r in registros if r.get("status") in STATUS_CRITICOS]
+    ws2 = wb.create_sheet("Divergencias")
     _escrever_cabecalho(ws2, "C00000")
     _escrever_dados(ws2, criticos)
     ws2.freeze_panes = "A2"
     ws2.auto_filter.ref = ws2.dimensions
 
-    # ------------------------------------------------------------------
     # ABA 3: RESUMO
-    # ------------------------------------------------------------------
     ws3 = wb.create_sheet("Resumo")
 
-    ws3["A1"] = "RESUMO DA CONCILIAÇÃO"
+    ws3["A1"] = "RESUMO DA CONCILIACAO"
     ws3["A1"].font = Font(bold=True, size=14)
     ws3.merge_cells("A1:C1")
 
     ws3["A3"] = "Total de reembolsos"
     ws3["B3"] = len(registros)
 
-    div_cnpj, nao_lido = _contar_cnpj(registros)
+    div_cnpj = len(
+        [r for r in registros if r.get("cnpj_divergente") in (True, 1, "True")]
+    )
+    nao_lido = len(
+        [
+            r
+            for r in registros
+            if r.get("cnpj_divergente") is None or r.get("cnpj_divergente") == ""
+        ]
+    )
     ws3["A4"] = "CNPJ divergente"
     ws3["B4"] = div_cnpj
     ws3["A5"] = "CNPJ nao lido"
     ws3["B5"] = nao_lido
-    ws3["A6"] = "Na aba Divergências"
-    ws3["B6"] = len(criticos)
 
-    ws3["A8"] = "Por status"
-    ws3["A8"].font = Font(bold=True)
-    row = 9
+    ws3["A7"] = "Por status"
+    ws3["A7"].font = Font(bold=True)
+    row = 8
     for status, qtd in sorted(
         ps.estatisticas_por_status().items(), key=lambda x: -x[1]
     ):

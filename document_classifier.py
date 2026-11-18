@@ -1,23 +1,28 @@
 """Classificador de documentos por conteúdo (nunca pelo nome do arquivo).
 
+Ordem de decisão:
+1. Cache de layout: se o formato já foi visto, o tipo vem do cache.
+   Isso resolve os comprovantes de cliente, que têm dezenas de formatos
+   (PIX do Nubank, TED do Itaú, transferência do Bradesco, etc.).
+2. Guia fiscal: decidida antes da direção do pagamento. Uma guia DARE
+   tem sinais próprios que não aparecem em comprovante.
+3. Direção do pagamento: distingue comprovante Jadlog de comprovante
+   cliente pela posição da Jadlog (pagadora ou recebedora).
+4. Pontuação por sinais: fallback quando nada acima decidiu.
+
 A separação entre comprovante Jadlog e comprovante do cliente é feita pela
-DIREÇÃO do pagamento, não por palavras genéricas como "comprovante" ou
-"pagamento":
+DIREÇÃO do pagamento, não por palavras genéricas como "comprovante":
 
 - Comprovante Jadlog: a Jadlog PAGA o tributo. Ela aparece como cliente
   pagador e o governo/beneficiário recebe.
 - Comprovante Cliente: o cliente PAGA a Jadlog. A Jadlog aparece como
   recebedora e o cliente como pagador.
-
-A GUIA é decidida ANTES da direção do pagamento: uma guia DARE/GNRE tem
-sinais próprios (código de barras, período de apuração, secretaria da
-fazenda) que não aparecem em comprovante. Sem essa prioridade, a guia
-perdia para o comprovante de pagamento da própria guia.
 """
 
 import re
 from pathlib import Path
 
+import layout_cache
 from config import TipoDoc
 from excel_reader import ler_planilha_bruta
 from log_manager import get_logger
@@ -30,7 +35,7 @@ log = get_logger("classifier")
 # ---------------------------------------------------------------------------
 
 # Sinais fortes de GUIA FISCAL.
-# Sao sinais que aparecem na guia e NAO aparecem no comprovante de pagamento.
+# São sinais que aparecem na guia e NÃO aparecem no comprovante de pagamento.
 SINAIS_GUIA = {
     "dare": 30,
     "gnre": 30,
@@ -113,7 +118,7 @@ SINAIS_COMP_CLIENTE = {
 }
 
 # Sinais que NUNCA devem aparecer numa guia. Se aparecerem, o documento
-# e comprovante, nao guia. Usado para desempatar.
+# é comprovante, não guia. Usado para desempatar.
 SINAIS_ANTI_GUIA = {
     "comprovante de pagamento": 30,
     "comprovante do pix": 40,
@@ -132,7 +137,7 @@ SINAIS_ANTI_GUIA = {
 EXT_PLANILHA = {".xlsx", ".xls", ".csv"}
 EXT_TEXTO = {".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"}
 
-# Limite minimo de score para aceitar a classificacao.
+# Limite mínimo de score para aceitar a classificação.
 # Abaixo disso, o documento vai para desconhecido em vez de chutar.
 SCORE_MINIMO = 25
 
@@ -204,12 +209,12 @@ def _pontuar(texto: str, sinais: dict[str, int]) -> tuple[int, list[str]]:
 
 
 def _e_guia(score_guia: int, sinais_anti_guia: int) -> bool:
-    """Decide se o documento e guia.
+    """Decide se o documento é guia.
 
-    Guia so e aceita quando tem score proprio alto E nao tem sinais
-    fortes de comprovante. Um comprovante de pagamento de DARE contem
-    "tributo" e "vencimento" (sinais de guia), mas tambem "comprovante
-    de pagamento" e "autenticacao bancaria" (sinais anti-guia).
+    Guia só é aceita quando tem score próprio alto E não tem sinais
+    fortes de comprovante. Um comprovante de pagamento de DARE contém
+    "tributo" e "vencimento" (sinais de guia), mas também "comprovante
+    de pagamento" e "autenticação bancária" (sinais anti-guia).
     """
     if score_guia < SCORE_MINIMO:
         return False
@@ -246,10 +251,25 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
         return TipoDoc.DESCONHECIDO, 0.0
 
     # ------------------------------------------------------------------
-    # 1) GUIA tem prioridade sobre a direcao do pagamento.
-    # Uma guia DARE/GNRE tem sinais proprios que nao aparecem em
+    # 1) CACHE DE LAYOUT: formato já visto decide o tipo.
+    # Resolve os comprovantes de cliente, que têm dezenas de formatos.
+    # ------------------------------------------------------------------
+    do_cache = layout_cache.buscar_tipo_por_hash(texto)
+    if do_cache:
+        tipo_cache, conf_cache = do_cache
+        log.info(
+            "%s -> %s (%.1f%%) pelo cache de layout",
+            caminho.name,
+            tipo_cache,
+            conf_cache,
+        )
+        return tipo_cache, conf_cache
+
+    # ------------------------------------------------------------------
+    # 2) GUIA tem prioridade sobre a direção do pagamento.
+    # Uma guia DARE/GNRE tem sinais próprios que não aparecem em
     # comprovante. Sem essa prioridade, a guia perdia para o comprovante
-    # de pagamento da propria guia.
+    # de pagamento da própria guia.
     # ------------------------------------------------------------------
     score_guia, sinais_guia = _pontuar(texto, SINAIS_GUIA)
     score_anti_guia, sinais_anti = _pontuar(texto, SINAIS_ANTI_GUIA)
@@ -267,8 +287,8 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
         return TipoDoc.GUIA, round(confianca, 1)
 
     # ------------------------------------------------------------------
-    # 2) Direcao do pagamento: distingue comprovante Jadlog de cliente.
-    # So roda depois que a guia foi descartada.
+    # 3) Direção do pagamento: distingue comprovante Jadlog de cliente.
+    # Só roda depois que a guia foi descartada.
     # ------------------------------------------------------------------
     direcao = _detectar_direcao(texto)
     if direcao == "JADLOG":
@@ -294,8 +314,8 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
         return TipoDoc.COMP_CLIENTE, round(confianca, 1)
 
     # ------------------------------------------------------------------
-    # 3) Sem direcao clara: pontuacao por sinais entre os comprovantes.
-    # A guia ja foi descartada no passo 1.
+    # 4) Sem direção clara: pontuação por sinais entre os comprovantes.
+    # A guia já foi descartada no passo 2.
     # ------------------------------------------------------------------
     score_jadlog, sinais_jadlog = _pontuar(texto, SINAIS_COMP_JADLOG)
     score_cliente, sinais_cliente = _pontuar(texto, SINAIS_COMP_CLIENTE)
@@ -308,7 +328,7 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
     melhor = max(scores, key=scores.get)
     if scores[melhor] < SCORE_MINIMO:
         log.info(
-            "%s -> DESCONHECIDO (score abaixo do minimo: %d)",
+            "%s -> DESCONHECIDO (score abaixo do mínimo: %d)",
             caminho.name,
             scores[melhor],
         )

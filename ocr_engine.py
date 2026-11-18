@@ -5,21 +5,32 @@ Estrategia:
 2. PDF sem camada de texto (escaneado): rasteriza e passa pelo Tesseract.
 3. Imagem: passa direto pelo Tesseract.
 
-Pre-processamento antes do OCR:
-- Escala de cinza
-- Binarizacao adaptativa (melhor que threshold fixo em documento amarelado)
-- Remocao de ruido leve
-- Upscale quando a imagem e pequena
+Pre-processamento adaptativo por tipo de imagem:
+- Documento escaneado (papel): escala de cinza + mediana + binarizacao.
+- Print de tela (celular): escala de cinza, SEM binarizacao e SEM mediana
+  (filtros borram caracteres finos de fonte de sistema).
 
-Pos-processamento do texto:
+Upscale: so em imagens abaixo de 900px de largura. Print de celular tem
+1080px+ e NAO e redimensionado — o LANCZOS suaviza o traco fino e o
+Tesseract perde caracteres.
+
+Modo do Tesseract adaptativo:
+- Print de tela: --psm 4 (colunas de tamanho variavel)
+- Documento escaneado: --psm 6 (bloco uniforme)
+
+Fallback de OCR: se o texto sair curto, tenta outros --psm e escolhe o
+resultado com mais caracteres. Evita perder linhas quando o modo padrao
+nao captura o layout.
+
+Pos-processamento:
 - Corrige caracteres que o Tesseract confunde em contexto de CNPJ/valor
-- Normaliza espacos e quebras de linha
+- Corrige meses por extenso quebrados pelo OCR (oututro -> outubro)
+- Normaliza espacos multiplos SEM remover quebras de linha
 - Remove caracteres de controle
 """
 
 import hashlib
 import re
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -36,11 +47,19 @@ from log_manager import get_logger
 
 log = get_logger("ocr")
 
-# Cache em memoria: hash do arquivo -> texto extraido.
-# Evita repetir OCR do mesmo arquivo quando o pipeline roda varias vezes.
 _CACHE: dict[str, str] = {}
-
 EXT_IMAGEM = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif"}
+
+# Upscale so em imagens MUITO pequenas. Print de celular (1080px+) passa
+# intacto — o LANCZOS suaviza o traco fino da fonte e apaga caracteres.
+LARGURA_MIN_UPSCALE = 900
+
+# Limite de cores distintas para considerar a imagem um print de tela.
+MAX_CORES_PRINT = 64
+
+# Abaixo desse numero de caracteres, o OCR e considerado fraco e o motor
+# tenta um segundo modo do Tesseract.
+MIN_CHARS_OCR_BOM = 80
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +68,6 @@ EXT_IMAGEM = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif"}
 
 
 def _hash_arquivo(caminho: Path) -> str:
-    """Hash do conteudo do arquivo (nao do nome)."""
     h = hashlib.sha256()
     with open(caminho, "rb") as f:
         for bloco in iter(lambda: f.read(65536), b""):
@@ -63,76 +81,113 @@ def _cache_get(chave: str) -> str | None:
 
 def _cache_set(chave: str, texto: str) -> None:
     if len(_CACHE) >= OCR_CACHE_MAX:
-        # remove o mais antigo (dict preserva ordem de insercao)
         _CACHE.pop(next(iter(_CACHE)), None)
     _CACHE[chave] = texto
 
 
 # ---------------------------------------------------------------------------
-# PRE-PROCESSAMENTO DE IMAGEM
+# DETECCAO DO TIPO DE IMAGEM
 # ---------------------------------------------------------------------------
 
 
-def _preprocessar_imagem(caminho: Path) -> Path:
+def _e_print_de_tela(img) -> bool:
+    """Detecta se a imagem e um print de tela (celular/desktop).
+
+    Print de tela tem fundo predominantemente claro e poucas cores
+    distintas. Documento escaneado tem gradiente de cinza e muitas cores.
+    """
+    try:
+        pequena = img.copy()
+        pequena.thumbnail((300, 300))
+
+        cores = pequena.convert("RGB").getcolors(maxcolors=10000)
+        if cores is None:
+            return False
+
+        if len(cores) > MAX_CORES_PRINT:
+            return False
+
+        cores_ord = sorted(cores, reverse=True)[:5]
+        total_pixels = sum(c[0] for c in cores)
+        if total_pixels == 0:
+            return False
+
+        pixels_claros = sum(
+            c[0] for c in cores_ord if c[1][0] > 200 and c[1][1] > 200 and c[1][2] > 200
+        )
+        proporcao_claro = pixels_claros / total_pixels
+
+        return proporcao_claro > 0.4
+
+    except Exception as e:
+        log.debug("Falha ao detectar tipo de imagem: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# PRE-PROCESSAMENTO
+# ---------------------------------------------------------------------------
+
+
+def _preprocessar_imagem(caminho: Path) -> tuple[Path, bool]:
     """Prepara a imagem para o OCR.
 
-    Converte para escala de cinza, aplica binarizacao adaptativa e faz
-    upscale quando a imagem e pequena. Documento fiscal escaneado em
-    papel amarelado melhora muito com binarizacao adaptativa.
+    Retorna (caminho_preparado, e_print_de_tela).
+
+    Print de tela: escala de cinza, SEM binarizacao e SEM mediana.
+    Documento escaneado: escala de cinza + mediana + binarizacao adaptativa.
     """
     try:
         from PIL import Image, ImageFilter, ImageOps
     except ImportError:
         log.warning("Pillow nao instalado — OCR sem pre-processamento")
-        return caminho
+        return caminho, False
 
     try:
         img = Image.open(caminho)
         img = ImageOps.exif_transpose(img)
 
-        # escala de cinza
+        e_print = _e_print_de_tela(img)
+
         if img.mode != "L":
             img = img.convert("L")
 
-        # upscale quando a imagem e pequena (melhora muito o OCR)
-        largura_min = 1600
-        if img.width < largura_min:
-            fator = largura_min / img.width
+        # Upscale so em imagem muito pequena
+        if img.width < LARGURA_MIN_UPSCALE:
+            fator = LARGURA_MIN_UPSCALE / img.width
             nova = (int(img.width * fator), int(img.height * fator))
             img = img.resize(nova, Image.LANCZOS)
+            log.debug("Upscale aplicado: %s -> %dx%d", caminho.name, *nova)
 
-        # reducao de ruido leve
-        img = img.filter(ImageFilter.MedianFilter(size=3))
-
-        # binarizacao adaptativa: melhor que threshold fixo em documento
-        # com fundo irregular (papel amarelado, sombra de digitalizacao)
-        img = _binarizar_adaptativo(img)
+        if e_print:
+            # Print de tela: NENHUM filtro. A imagem ja e limpa, e a
+            # mediana borra os caracteres finos de fonte de sistema.
+            log.debug(
+                "Pre-processando como print de tela (sem filtro): %s", caminho.name
+            )
+        else:
+            # Documento escaneado: mediana + binarizacao adaptativa
+            img = img.filter(ImageFilter.MedianFilter(size=3))
+            img = _binarizar_adaptativo(img)
+            log.debug("Pre-processando como documento escaneado: %s", caminho.name)
 
         destino = Path(tempfile.gettempdir()) / f"ocr_{caminho.stem}.png"
         img.save(destino, "PNG")
-        return destino
+        return destino, e_print
 
     except Exception as e:
         log.warning("Falha no pre-processamento de %s: %s", caminho.name, e)
-        return caminho
+        return caminho, False
 
 
 def _binarizar_adaptativo(img):
-    """Binarizacao adaptativa por media local.
-
-    Para cada pixel, compara com a media da vizinhanca. Se o pixel e
-    mais escuro que a media menos uma margem, vira preto. Senao, branco.
-    Funciona bem em documento com fundo irregular.
-    """
+    """Binarizacao adaptativa por media local (documento escaneado)."""
     try:
-        from PIL import Image, ImageFilter
+        from PIL import ImageFilter
     except ImportError:
         return img
 
-    # media local com blur grande
     media = img.filter(ImageFilter.BoxBlur(15))
-
-    # aplica: pixel < media - margem -> preto
     pixels = img.load()
     pixels_media = media.load()
     largura, altura = img.size
@@ -144,7 +199,6 @@ def _binarizar_adaptativo(img):
                 pixels[x, y] = 0
             else:
                 pixels[x, y] = 255
-
     return img
 
 
@@ -153,11 +207,22 @@ def _binarizar_adaptativo(img):
 # ---------------------------------------------------------------------------
 
 
-def _rodar_tesseract(imagem: Path) -> str:
-    """Executa o Tesseract e devolve o texto."""
+def _rodar_tesseract(
+    imagem: Path, e_print: bool = False, psm: str | None = None
+) -> str:
+    """Executa o Tesseract com o modo adequado ao tipo de imagem.
+
+    Print de tela: --psm 4 (colunas de tamanho variavel).
+    Documento escaneado: --psm 6 (bloco uniforme).
+
+    O parametro `psm` permite forcar um modo especifico no fallback.
+    """
     if not Path(TESSERACT_CMD).is_file():
         log.error("Tesseract nao encontrado em %s", TESSERACT_CMD)
         return ""
+
+    if psm is None:
+        psm = "4" if e_print else "6"
 
     cmd = [
         TESSERACT_CMD,
@@ -166,14 +231,13 @@ def _rodar_tesseract(imagem: Path) -> str:
         "-l",
         TESSERACT_LANG,
         "--psm",
-        "6",  # bloco uniforme de texto: melhor para documento fiscal
+        psm,
         "--oem",
-        "3",  # LSTM + legacy, mais robusto
+        "3",
         "-c",
         "preserve_interword_spaces=1",
     ]
 
-    # tessdata ao lado do executavel (Tesseract portatil)
     if Path(TESSDATA_DIR).is_dir():
         cmd += ["--tessdata-dir", TESSDATA_DIR]
 
@@ -193,6 +257,7 @@ def _rodar_tesseract(imagem: Path) -> str:
                 resultado.stderr[:200],
             )
         return resultado.stdout or ""
+
     except subprocess.TimeoutExpired:
         log.error("Tesseract excedeu o tempo em %s", imagem.name)
         return ""
@@ -201,19 +266,44 @@ def _rodar_tesseract(imagem: Path) -> str:
         return ""
 
 
+def _ocr_com_fallback(imagem: Path, e_print: bool) -> str:
+    """Roda o Tesseract e, se o texto sair fraco, tenta outro --psm.
+
+    Print de tela: tenta psm 4, depois psm 6 e psm 11.
+    Documento escaneado: tenta psm 6, depois psm 4.
+
+    Escolhe o resultado com mais caracteres. Evita perder linhas quando o
+    modo padrao nao captura o layout do documento.
+    """
+    modos = ["4", "6", "11"] if e_print else ["6", "4"]
+
+    melhor = ""
+    for modo in modos:
+        texto = _rodar_tesseract(imagem, e_print, psm=modo)
+        if len(texto.strip()) > len(melhor.strip()):
+            melhor = texto
+        if len(melhor.strip()) >= MIN_CHARS_OCR_BOM * 3:
+            break
+
+    if len(melhor.strip()) < MIN_CHARS_OCR_BOM:
+        log.warning(
+            "OCR fraco em %s: %d chars (minimo %d)",
+            imagem.name,
+            len(melhor.strip()),
+            MIN_CHARS_OCR_BOM,
+        )
+
+    return melhor
+
+
 # ---------------------------------------------------------------------------
 # PDF
 # ---------------------------------------------------------------------------
 
 
 def _texto_de_pdf(caminho: Path) -> str:
-    """Tenta extrair a camada de texto do PDF.
-
-    Se o PDF tem camada de texto (gerado por sistema), o texto e exato
-    e nao precisa de OCR. Se for escaneado, devolve vazio.
-    """
     try:
-        import fitz  # PyMuPDF
+        import fitz
     except ImportError:
         log.warning("PyMuPDF nao instalado — PDF sempre passa por OCR")
         return ""
@@ -232,9 +322,8 @@ def _texto_de_pdf(caminho: Path) -> str:
 
 
 def _ocr_de_pdf(caminho: Path) -> str:
-    """Rasteriza o PDF e passa cada pagina pelo Tesseract."""
     try:
-        import fitz  # PyMuPDF
+        import fitz
     except ImportError:
         log.error("PyMuPDF necessario para OCR de PDF escaneado")
         return ""
@@ -243,22 +332,18 @@ def _ocr_de_pdf(caminho: Path) -> str:
         doc = fitz.open(caminho)
         partes = []
         for i, pagina in enumerate(doc):
-            # 300 DPI: padrao para documento fiscal
             pix = pagina.get_pixmap(dpi=OCR_DPI)
             tmp = Path(tempfile.gettempdir()) / f"pdf_{caminho.stem}_p{i}.png"
             pix.save(tmp)
-
-            preparada = _preprocessar_imagem(tmp)
-            texto = _rodar_tesseract(preparada)
+            preparada, e_print = _preprocessar_imagem(tmp)
+            texto = _ocr_com_fallback(preparada, e_print)
             partes.append(texto)
-
             for p in (tmp, preparada):
                 try:
                     if p != caminho and p.exists():
                         p.unlink()
                 except OSError:
                     pass
-
         doc.close()
         return "\n".join(partes)
     except Exception as e:
@@ -267,11 +352,9 @@ def _ocr_de_pdf(caminho: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# POS-PROCESSAMENTO DO TEXTO
+# POS-PROCESSAMENTO
 # ---------------------------------------------------------------------------
 
-# Correcoes que o Tesseract erra com frequencia em documento fiscal.
-# Aplicadas apenas em linhas que tem cara de CNPJ ou valor.
 RE_LINHA_CNPJ = re.compile(r"(?:cnpj|cpf|contribuinte|pagador)", re.IGNORECASE)
 RE_LINHA_VALOR = re.compile(r"(?:valor|total|r\$)", re.IGNORECASE)
 
@@ -289,41 +372,92 @@ MAPA_OCR_DIGITOS = str.maketrans(
     }
 )
 
+MESES_OCR = {
+    "janeiro": ["janeiro", "janeuo", "janeire", "janeirc"],
+    "fevereiro": ["fevereiro", "fevereirc", "fevereuo"],
+    "marco": ["marco", "março", "marc0"],
+    "abril": ["abril", "abrll", "abri1"],
+    "maio": ["maio", "maic", "mai0"],
+    "junho": ["junho", "junhc", "junh0"],
+    "julho": ["julho", "julhc", "julh0"],
+    "agosto": ["agosto", "agostc", "agost0", "agostto"],
+    "setembro": ["setembro", "setembrc", "setembr0", "setembto"],
+    "outubro": [
+        "outubro",
+        "oututro",
+        "outubrc",
+        "outubr0",
+        "outubto",
+        "owutro",
+        "lowutro",
+        "7lowutro",
+    ],
+    "novembro": ["novembro", "novembrc", "novembr0"],
+    "dezembro": ["dezembro", "dezembrc", "dezembr0"],
+}
+
+CORRECAO_MESES = {}
+for _correto, _variantes in MESES_OCR.items():
+    for _v in _variantes:
+        CORRECAO_MESES[_v] = _correto
+
 
 def _corrigir_linha_cnpj(linha: str) -> str:
-    """Corrige caracteres confundidos em linha que contem CNPJ."""
-
-    # so corrige o trecho que tem cara de CNPJ (14 digitos com pontuacao)
     def _sub(m):
         return m.group(0).translate(MAPA_OCR_DIGITOS)
 
     return re.sub(r"[\dOoIl|SBZG][\dOoIl|SBZG.\-/]{12,20}", _sub, linha)
 
 
+def _corrigir_meses(texto: str) -> str:
+    """Corrige meses por extenso quebrados pelo OCR."""
+    for variante, correto in CORRECAO_MESES.items():
+        if variante != correto:
+            texto = re.sub(rf"\b{variante}\b", correto, texto, flags=re.IGNORECASE)
+
+    def _corrigir_dia_mes(m):
+        dia_bruto = m.group(1)
+        mes = m.group(2)
+        dia_limpo = re.sub(r"^[lL7]", "1", dia_bruto)
+        return f"{dia_limpo}/{mes}"
+
+    texto = re.sub(
+        r"(\d[lL7]?\d?|l\d|[lL])(outubro|novembro|dezembro|setembro|agosto|"
+        r"julho|junho|maio|abril|marco|março|fevereiro|janeiro)",
+        _corrigir_dia_mes,
+        texto,
+        flags=re.IGNORECASE,
+    )
+
+    return texto
+
+
 def _pos_processar(texto: str) -> str:
-    """Limpa e corrige o texto do OCR."""
+    """Limpa e corrige o texto do OCR SEM perder linhas.
+
+    CRITICO: nao colapsa quebras de linha. O layout em blocos do
+    comprovante (Mercado Pago, Nubank) depende das linhas vazias para
+    separar secoes. Colapsar demais junta blocos que o pdf_reader
+    precisa distinguir.
+    """
     if not texto:
         return ""
 
-    # remove caracteres de controle
+    # Remove caracteres de controle (mantem \n e \t)
     texto = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", texto)
+
+    texto = _corrigir_meses(texto)
 
     linhas = []
     for linha in texto.splitlines():
-        # corrige CNPJ so em linhas com contexto de CNPJ
         if RE_LINHA_CNPJ.search(linha):
             linha = _corrigir_linha_cnpj(linha)
-
-        # normaliza espacos multiplos
-        linha = re.sub(r"[ \t]+", " ", linha).strip()
+        # Normaliza espacos multiplos, mas NAO remove a linha
+        linha = re.sub(r"[ \t]+", " ", linha).rstrip()
         linhas.append(linha)
 
-    texto = "\n".join(linhas)
-
-    # remove linhas vazias consecutivas
-    texto = re.sub(r"\n{3,}", "\n\n", texto)
-
-    return texto.strip()
+    # Preserva TODAS as linhas (inclusive vazias)
+    return "\n".join(linhas).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +471,7 @@ def extrair_texto(caminho: Path | str) -> str:
     Ordem:
     1. Cache por hash do arquivo
     2. PDF: tenta camada de texto; se falhar, OCR
-    3. Imagem: pre-processa e roda OCR
+    3. Imagem: detecta tipo, pre-processa e roda OCR com fallback
     """
     caminho = Path(caminho)
     if not caminho.is_file():
@@ -358,8 +492,8 @@ def extrair_texto(caminho: Path | str) -> str:
             log.info("PDF sem camada de texto, usando OCR: %s", caminho.name)
             texto = _ocr_de_pdf(caminho)
     elif ext in EXT_IMAGEM:
-        preparada = _preprocessar_imagem(caminho)
-        texto = _rodar_tesseract(preparada)
+        preparada, e_print = _preprocessar_imagem(caminho)
+        texto = _ocr_com_fallback(preparada, e_print)
         try:
             if preparada != caminho and preparada.exists():
                 preparada.unlink()
@@ -371,6 +505,10 @@ def extrair_texto(caminho: Path | str) -> str:
 
     texto = _pos_processar(texto)
     _cache_set(chave, texto)
-
-    log.info("OCR concluido: %s (%d chars)", caminho.name, len(texto))
+    log.info(
+        "OCR concluido: %s (%d chars, %d linhas)",
+        caminho.name,
+        len(texto),
+        texto.count("\n") + 1,
+    )
     return texto
