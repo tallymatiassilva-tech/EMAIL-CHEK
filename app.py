@@ -19,7 +19,6 @@ st.set_page_config(
     layout="wide",
 )
 
-
 # ---------------------------------------------------------------- dados
 
 
@@ -113,6 +112,15 @@ def _campos_do_json(campos_json: str | None) -> dict:
     return dados.get("campos", dados) or {}
 
 
+def _ler_json_bruto(campos_json: str | None) -> dict:
+    """Le o campos_json inteiro, preservando texto e _rotulos."""
+    try:
+        dados = json.loads(campos_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return dados if isinstance(dados, dict) else {}
+
+
 def _diagnosticar_item(item: dict) -> dict:
     """Analisa o item e devolve o diagnostico completo de campos ausentes.
 
@@ -133,11 +141,11 @@ def _diagnosticar_item(item: dict) -> dict:
     """
     campos = _campos_do_json(item.get("campos_json"))
     tipo = item.get("tipo_documento", "")
-
     obrigatorios = CAMPOS_POR_TIPO.get(tipo, [])
 
     ausentes = []
     detalhes = []
+
     for chave, sev, categoria in obrigatorios:
         valor = campos.get(chave)
         if valor in (None, "", 0, 0.0):
@@ -221,6 +229,51 @@ def _filtrar_itens(
     return resultado
 
 
+def _render_filtros(itens: list[dict], prefixo: str) -> tuple:
+    """Renderiza os tres filtros e devolve (severidades, tipos, remessas).
+
+    prefixo: 'fila' ou 'resolver' — garante keys unicas no Streamlit.
+    """
+    col_f1, col_f2, col_f3 = st.columns(3)
+
+    sev_opcoes = {
+        "🔴 Critico (valor)": 0,
+        "🟠 Alto (data)": 1,
+        "🟡 Medio (CNPJ/NF)": 2,
+        "🟢 Baixo (outros)": 3,
+    }
+    sev_escolhidas = col_f1.multiselect(
+        "Severidade",
+        list(sev_opcoes.keys()),
+        key=f"{prefixo}_sev",
+    )
+    sev_filtro = [sev_opcoes[s] for s in sev_escolhidas] if sev_escolhidas else None
+
+    tipos_disponiveis = sorted({i["tipo_documento"] for i in itens})
+    tipos_filtro = (
+        col_f2.multiselect(
+            "Tipo de documento",
+            tipos_disponiveis,
+            key=f"{prefixo}_tipo",
+        )
+        or None
+    )
+
+    remessas_disponiveis = sorted(
+        {i["numero_remessa"] for i in itens if i["numero_remessa"]}
+    )
+    remessas_filtro = (
+        col_f3.multiselect(
+            "Remessa",
+            remessas_disponiveis,
+            key=f"{prefixo}_rem",
+        )
+        or None
+    )
+
+    return sev_filtro, tipos_filtro, remessas_filtro
+
+
 def _gerar_excel_criticos(itens: list[dict]) -> bytes:
     """Gera um Excel com os itens criticos e devolve os bytes."""
     try:
@@ -253,7 +306,6 @@ def _gerar_excel_criticos(itens: list[dict]) -> bytes:
 
     # Ordena por severidade
     itens_ord = sorted(itens, key=lambda x: (x["_severidade"], -x["id"]))
-
     for i in itens_ord:
         ws.append(
             [
@@ -299,6 +351,7 @@ abas = st.tabs(
         "9. Validacao",
         "10. Reprocessar",
         "11. Backup",
+        "12. Reprocessar fila",
     ]
 )
 
@@ -325,6 +378,7 @@ with abas[0]:
                     except Exception as e:
                         st.session_state["pastas"] = []
                         st.error(f"Falha ao listar pastas: {e}")
+
         with col_b:
             if st.button("Limpar lista", key="btn_limpar_pastas"):
                 st.session_state.pop("pastas", None)
@@ -340,6 +394,7 @@ with abas[0]:
                 help="Selecione uma ou mais pastas. Cada pasta sera varrida "
                 "separadamente e os resultados serao somados.",
             )
+
             if escolhidas:
                 total_itens = sum(
                     mapa[c].get("total_itens", 0)
@@ -519,42 +574,7 @@ with abas[5]:
         st.divider()
         st.write("**Filtros**")
 
-        col_f1, col_f2, col_f3 = st.columns(3)
-
-        sev_opcoes = {
-            "🔴 Critico (valor)": 0,
-            "🟠 Alto (data)": 1,
-            "🟡 Medio (CNPJ/NF)": 2,
-            "🟢 Baixo (outros)": 3,
-        }
-        sev_escolhidas = col_f1.multiselect(
-            "Severidade",
-            list(sev_opcoes.keys()),
-            key="fila_sev",
-        )
-        sev_filtro = [sev_opcoes[s] for s in sev_escolhidas] if sev_escolhidas else None
-
-        tipos_disponiveis = sorted({i["tipo_documento"] for i in itens})
-        tipos_filtro = (
-            col_f2.multiselect(
-                "Tipo de documento",
-                tipos_disponiveis,
-                key="fila_tipo",
-            )
-            or None
-        )
-
-        remessas_disponiveis = sorted(
-            {i["numero_remessa"] for i in itens if i["numero_remessa"]}
-        )
-        remessas_filtro = (
-            col_f3.multiselect(
-                "Remessa",
-                remessas_disponiveis,
-                key="fila_rem",
-            )
-            or None
-        )
+        sev_filtro, tipos_filtro, remessas_filtro = _render_filtros(itens, "fila")
 
         filtrados = _filtrar_itens(itens, sev_filtro, tipos_filtro, remessas_filtro)
 
@@ -601,7 +621,6 @@ with abas[6]:
             st.info("Nenhum item pendente na fila.")
         else:
             pendentes = _preparar_itens(pendentes)
-
             total = len(pendentes)
             por_sev = {
                 s: sum(1 for p in pendentes if p["_severidade"] == s) for s in range(4)
@@ -625,47 +644,11 @@ with abas[6]:
             st.divider()
             st.write("**Filtros**")
 
-            col_f1, col_f2, col_f3 = st.columns(3)
-
-            sev_opcoes = {
-                "🔴 Critico (valor)": 0,
-                "🟠 Alto (data)": 1,
-                "🟡 Medio (CNPJ/NF)": 2,
-                "🟢 Baixo (outros)": 3,
-            }
-            sev_escolhidas = col_f1.multiselect(
-                "Severidade",
-                list(sev_opcoes.keys()),
-                key="resolver_sev",
-            )
-            sev_filtro = (
-                [sev_opcoes[s] for s in sev_escolhidas] if sev_escolhidas else None
-            )
-
-            tipos_disponiveis = sorted({p["tipo_documento"] for p in pendentes})
-            tipos_filtro = (
-                col_f2.multiselect(
-                    "Tipo de documento",
-                    tipos_disponiveis,
-                    key="resolver_tipo",
-                )
-                or None
-            )
-
-            remessas_disponiveis = sorted(
-                {p["numero_remessa"] for p in pendentes if p["numero_remessa"]}
-            )
-            remessas_filtro = (
-                col_f3.multiselect(
-                    "Remessa",
-                    remessas_disponiveis,
-                    key="resolver_rem",
-                )
-                or None
+            sev_filtro, tipos_filtro, remessas_filtro = _render_filtros(
+                pendentes, "resolver"
             )
 
             col_btn1, col_btn2 = st.columns([1, 1])
-
             if col_btn1.button(
                 "🔴 Mostrar so itens criticos",
                 key="btn_so_criticos",
@@ -737,7 +720,6 @@ with abas[6]:
                 campos_atuais = _campos_do_json(item.get("campos_json"))
 
                 col_doc, col_form = st.columns([1, 1])
-
                 with col_doc:
                     st.write("**Documento**")
                     mostrar_documento(item["caminho_arquivo"], altura=460)
@@ -837,7 +819,7 @@ with abas[6]:
                             if v not in (None, ""):
                                 novos_campos[k] = v
 
-                        novo_json = dict(_campos_do_json(item.get("campos_json")))
+                        novo_json = _ler_json_bruto(item.get("campos_json"))
                         novo_json["campos"] = novos_campos
                         novo_json["confianca"] = nova_confianca
                         novo_json["editado_manualmente"] = True
@@ -855,6 +837,7 @@ with abas[6]:
                                 item["id"],
                             ),
                         )
+
                         st.success(
                             f"Item #{item['id']} atualizado: tipo={novo_tipo}, "
                             f"remessa={nova_remessa}, conf={nova_confianca}."
@@ -951,6 +934,7 @@ with abas[6]:
                             st.json(d["depois"])
 
                 st.cache_data.clear()
+
                 if ret["aplicado"]:
                     st.rerun()
 
@@ -983,6 +967,7 @@ with abas[8]:
         "Revise as remessas em divergencia, compare os documentos e decida: "
         "aprovar como conferido ou manter a divergencia."
     )
+
     try:
         if "reembolsos" not in tabelas_existentes():
             st.info("Tabela reembolsos nao encontrada.")
@@ -1070,7 +1055,6 @@ with abas[8]:
                     )
 
                     b1, b2, b3 = st.columns(3)
-
                     if b1.button("Aprovar como conferido", type="primary"):
                         executar(
                             "UPDATE reembolsos SET status = 'CONFERIDO', "
@@ -1113,6 +1097,7 @@ with abas[8]:
                             st.cache_data.clear()
                         except Exception as e:
                             st.warning(f"Reprocessamento falhou: {e}")
+
     except Exception as e:
         st.warning(f"Nao foi possivel carregar a validacao: {e}")
 
@@ -1175,3 +1160,108 @@ with abas[10]:
             st.caption("Nenhum backup ainda.")
     except Exception as e:
         st.warning(f"Nao foi possivel listar os backups: {e}")
+
+# ---- 12. reprocessar fila (aba nova)
+with abas[11]:
+    st.subheader("Reprocessar a fila de treinamento")
+    st.caption(
+        "Roda o OCR e a extracao de novo em todos os itens pendentes. "
+        "Use o dry-run para ver o resultado antes de gravar."
+    )
+
+    try:
+        pendentes_total = consultar(
+            "SELECT COUNT(*) AS n FROM fila_treinamento WHERE resolvido = 0"
+        )[0]["n"]
+    except Exception:
+        pendentes_total = 0
+
+    st.metric("Itens pendentes na fila", pendentes_total)
+
+    if pendentes_total == 0:
+        st.success("Fila vazia. Nada a reprocessar.")
+    else:
+        col_lim, col_dry = st.columns(2)
+
+        limite_lote = col_lim.number_input(
+            "Limite de itens (0 = todos)",
+            min_value=0,
+            value=0,
+            step=5,
+            key="aba12_limite",
+        )
+        dry_run = col_dry.checkbox(
+            "Dry-run (nao grava)",
+            value=True,
+            key="aba12_dry",
+        )
+
+        if st.button("Reprocessar fila", type="primary", key="aba12_btn"):
+            try:
+                from reprocessar_fila import reprocessar
+
+                with st.spinner("Reprocessando a fila..."):
+                    ret = reprocessar(
+                        limite=int(limite_lote) or None,
+                        aplicar=not dry_run,
+                    )
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Processados", ret["total"])
+                c2.metric("Resolvidos", ret["resolvidos"])
+                c3.metric("Falhando", ret["falhando"])
+                c4.metric("Erros", ret["erros"])
+
+                if ret["aplicado"]:
+                    st.success("Campos gravados no banco.")
+                else:
+                    st.info("Dry-run: nada foi gravado.")
+
+                detalhes = ret.get("detalhes") or []
+
+                if detalhes:
+                    st.divider()
+                    st.write("**Antes e depois por item**")
+
+                    tabela = []
+                    for d in detalhes:
+                        antes = d.get("antes") or {}
+                        depois = d.get("depois") or {}
+
+                        valor_antes = (
+                            antes.get("valor_reembolso")
+                            or antes.get("valor_pago_jadlog")
+                            or antes.get("valor_guia")
+                        )
+                        valor_depois = (
+                            depois.get("valor_reembolso")
+                            or depois.get("valor_pago_jadlog")
+                            or depois.get("valor_guia")
+                        )
+
+                        tabela.append(
+                            {
+                                "Status": d.get("status"),
+                                "ID": d.get("id"),
+                                "Arquivo": d.get("arquivo"),
+                                "Tipo": d.get("tipo"),
+                                "Valor antes": valor_antes,
+                                "Valor depois": valor_depois,
+                                "Faltando": ", ".join(d.get("faltando") or []) or "-",
+                                "Conf.": d.get("confianca"),
+                            }
+                        )
+
+                    st.dataframe(tabela, width="stretch", hide_index=True)
+
+                    falhando = [d for d in detalhes if d.get("status") == "FALHANDO"]
+                    if falhando:
+                        st.warning(
+                            f"{len(falhando)} item(ns) continuam sem todos os "
+                            "campos. Veja a coluna 'Faltando' acima."
+                        )
+
+                st.cache_data.clear()
+
+            except Exception as e:
+                st.error(f"Falha no reprocessamento: {e}")

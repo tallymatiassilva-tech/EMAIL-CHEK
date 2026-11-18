@@ -66,15 +66,46 @@ def _listar_pendentes(limite: int | None = None) -> list[dict]:
         con.close()
 
 
-def _gravar_item(item_id: int, campos: dict, confianca: int) -> None:
-    """Grava os campos extraidos e marca o item como resolvido."""
+def _gravar_item(
+    item_id: int,
+    campos: dict,
+    confianca: int,
+    campos_json_antigo: str | None = None,
+    marcar_resolvido: bool = True,
+) -> None:
+    """Grava os campos extraidos preservando texto e _rotulos.
+
+    O JSON anterior e lido e reaproveitado: as chaves que nao sao campos
+    (texto, _rotulos e qualquer outra) continuam no registro. So os campos
+    e a confianca sao substituidos.
+
+    marcar_resolvido=False permite gravar uma extracao parcial sem tirar
+    o item da fila.
+    """
+    try:
+        base = json.loads(campos_json_antigo or "{}")
+    except (json.JSONDecodeError, TypeError):
+        base = {}
+    if not isinstance(base, dict):
+        base = {}
+
+    base["campos"] = campos
+    base["confianca"] = confianca
+
+    resolvido = 1 if marcar_resolvido else 0
+
     con = _conectar()
     try:
         con.execute(
             "UPDATE fila_treinamento "
-            "SET campos_json = ?, confianca = ?, resolvido = 1 "
+            "SET campos_json = ?, confianca = ?, resolvido = ? "
             "WHERE id = ?",
-            (json.dumps(campos, ensure_ascii=False), confianca, item_id),
+            (
+                json.dumps(base, ensure_ascii=False),
+                confianca,
+                resolvido,
+                item_id,
+            ),
         )
         con.commit()
     finally:
@@ -87,10 +118,17 @@ def _gravar_item(item_id: int, campos: dict, confianca: int) -> None:
 
 
 def _campos_do_item(item: dict) -> dict:
-    """Le o campos_json do item e devolve o dicionario de campos."""
+    """Le o campos_json do item e devolve o dicionario de campos.
+
+    Aceita os dois formatos:
+    - {"campos": {...}, "confianca": ...}  -> devolve o conteudo de "campos"
+    - {...campos soltos na raiz...}        -> devolve o dict inteiro
+    """
     try:
         dados = json.loads(item.get("campos_json") or "{}")
     except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(dados, dict):
         return {}
     return dados.get("campos", dados) or {}
 
@@ -136,13 +174,20 @@ def _extrair(item: dict) -> tuple[dict, list[str], int]:
 # ---------------------------------------------------------------------------
 
 
-def reprocessar(limite: int | None = None, aplicar: bool = False) -> dict:
+def reprocessar(
+    limite: int | None = None,
+    aplicar: bool = False,
+    gravar_parciais: bool = False,
+) -> dict:
     """Reprocessa a fila de treinamento.
 
     Args:
         limite: numero maximo de itens a processar. None = todos.
-        aplicar: se True, grava os campos no banco e marca como resolvidos.
+        aplicar: se True, grava os campos no banco.
                  Se False (padrao), apenas simula (dry-run).
+        gravar_parciais: quando True, tambem grava itens que continuam
+                 faltando campos (extracao parcial), sem marca-los como
+                 resolvidos. Padrao False: so grava o que ficou completo.
 
     Retorna:
         {
@@ -214,12 +259,22 @@ def reprocessar(limite: int | None = None, aplicar: bool = False) -> dict:
             }
         )
 
-        if aplicar and status == "RESOLVIDO":
-            try:
-                _gravar_item(item["id"], campos, confianca)
-            except Exception as e:
-                log.error("Falha ao gravar item %s: %s", item["id"], e)
-                erros += 1
+        if aplicar:
+            deve_gravar = status == "RESOLVIDO" or (
+                gravar_parciais and status == "FALHANDO"
+            )
+            if deve_gravar:
+                try:
+                    _gravar_item(
+                        item["id"],
+                        campos,
+                        confianca,
+                        item.get("campos_json"),
+                        marcar_resolvido=(status == "RESOLVIDO"),
+                    )
+                except Exception as e:
+                    log.error("Falha ao gravar item %s: %s", item["id"], e)
+                    erros += 1
 
     log.info(
         "Reprocessamento: %d processados, %d resolvidos, %d falhando, %d erros",
@@ -272,6 +327,11 @@ def main() -> None:
         default=None,
         help="Numero maximo de itens a processar.",
     )
+    parser.add_argument(
+        "--parciais",
+        action="store_true",
+        help="Tambem grava itens com extracao parcial (sem marcar como resolvidos).",
+    )
     args = parser.parse_args()
 
     modo = "APLICAR" if args.aplicar else "DRY-RUN (nada sera gravado)"
@@ -279,7 +339,11 @@ def main() -> None:
     print(f"  REPROCESSAMENTO DA FILA — {modo}")
     print("=" * 70)
 
-    ret = reprocessar(limite=args.limite, aplicar=args.aplicar)
+    ret = reprocessar(
+        limite=args.limite,
+        aplicar=args.aplicar,
+        gravar_parciais=args.parciais,
+    )
     _imprimir_detalhes(ret)
 
     print("=" * 70)

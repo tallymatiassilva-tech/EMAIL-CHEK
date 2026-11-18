@@ -24,18 +24,40 @@ CAMPOS_OBRIGATORIOS = ["valor_reembolso", "data_reembolso"]
 TIPOS_SUPORTADOS = {TipoDoc.COMP_CLIENTE}
 
 
+def _campos_do_json(campos_json: str | None) -> dict:
+    """Le o campos_json e devolve o dicionario de campos.
+
+    Aceita os dois formatos:
+    - {"campos": {...}, "confianca": ...}  -> devolve o conteudo de "campos"
+    - {...campos soltos na raiz...}        -> devolve o dict inteiro
+    """
+    try:
+        dados = json.loads(campos_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(dados, dict):
+        return {}
+    return dados.get("campos", dados) or {}
+
+
 def recalcular_item(campos_json: str) -> dict | None:
     """Recalcula um item da fila chamando o motor atual.
 
-    Retorna o novo dicionário {campos, faltando, texto, confianca} ou None
-    se o arquivo não existir mais ou o motor falhar.
+    Retorna o novo dicionario {campos, faltando, texto, confianca} ou None
+    se o arquivo nao existir mais ou o motor falhar.
+
+    Preserva as chaves extras do JSON original (_rotulos, editado_manualmente
+    e qualquer outra), sobrescrevendo apenas campos, faltando, texto e
+    confianca.
     """
     try:
-        dados = json.loads(campos_json)
-    except json.JSONDecodeError:
+        dados = json.loads(campos_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(dados, dict):
         return None
 
-    campos_antigos = dados.get("campos", {})
+    campos_antigos = dados.get("campos", dados) or {}
     caminho = campos_antigos.get("caminho")
 
     if not caminho:
@@ -72,12 +94,14 @@ def recalcular_item(campos_json: str) -> dict | None:
 
     faltando = [c for c in CAMPOS_OBRIGATORIOS if not campos_novos.get(c)]
 
-    return {
-        "campos": campos_novos,
-        "faltando": faltando,
-        "texto": novo.get("texto") or dados.get("texto", ""),
-        "confianca": novo.get("confianca", 0),
-    }
+    # Parte do JSON original para preservar _rotulos e chaves extras
+    resultado = dict(dados)
+    resultado["campos"] = campos_novos
+    resultado["faltando"] = faltando
+    resultado["texto"] = novo.get("texto") or dados.get("texto", "")
+    resultado["confianca"] = novo.get("confianca", 0)
+
+    return resultado
 
 
 def atualizar_fila(somente_pendentes: bool = True) -> None:
@@ -116,11 +140,7 @@ def atualizar_fila(somente_pendentes: bool = True) -> None:
         conf_nova = novo["confianca"]
         valor = novo["campos"].get("valor_reembolso")
 
-        try:
-            antigo = json.loads(campos_json)
-            valor_antigo = antigo.get("campos", {}).get("valor_reembolso")
-        except json.JSONDecodeError:
-            valor_antigo = None
+        valor_antigo = _campos_do_json(campos_json).get("valor_reembolso")
 
         with db.cursor() as cur:
             cur.execute(
