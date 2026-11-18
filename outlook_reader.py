@@ -1,5 +1,4 @@
 """Leitura de e-mails do Outlook e download de anexos.
-
 SOMENTE LEITURA: nunca move, marca, exclui ou altera nada no Outlook.
 A pasta de origem e a pasta de destino dos anexos são definidas pelo usuário.
 """
@@ -9,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import win32com.client
+
 from config import (
     EMAIL_MAX_AGE_DAYS,
     PASTA_ANEXOS_PADRAO,
@@ -28,6 +28,20 @@ class OutlookIndisponivel(Exception):
 
 
 def _conectar():
+    """Conecta ao Outlook. Inicializa o COM na thread atual.
+
+    O pywin32 exige CoInitialize por thread. O main.py roda na thread
+    principal (já inicializada), mas o Streamlit usa threads diferentes
+    a cada interação — sem isso, o erro CO_E_NOTINITIALIZED aparece.
+    """
+    import pythoncom
+
+    try:
+        pythoncom.CoInitialize()
+    except pythoncom.com_error:
+        # Já inicializado nesta thread — segue normalmente.
+        pass
+
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
         return outlook.GetNamespace("MAPI")
@@ -120,6 +134,7 @@ def escolher_pasta(pastas: list[dict], termo: str | None = None) -> dict | None:
     if len(candidatas) > 1:
         candidatas.sort(key=lambda p: (-p["total_itens"], p["nivel"], p["caminho"]))
         return candidatas[0]
+
     return None
 
 

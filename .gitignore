@@ -44,7 +44,11 @@ backup/
 # Scripts de debug e teste
 debug*.py
 teste*.py
-ver_*.py
+ver_fila.py
+ver_layouts.py
+ver_fila_treinamento.py
+ver_revisao_manual.py
+ver_tabelas.py
 limpar_cache*.py
 planilha_*.xlsx
 teste_simples.png
@@ -58,7 +62,11 @@ teste_simples.png
 # Scripts de diagnostico e teste
 debug*.py
 teste*.py
-ver_*.py
+ver_fila.py
+ver_layouts.py
+ver_fila_treinamento.py
+ver_revisao_manual.py
+ver_tabelas.py
 limpar_cache*.py
 migrar_camada.py
 testar_sistema.py

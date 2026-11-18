@@ -7,10 +7,11 @@ Fluxo por remessa:
 4. Classifica cada arquivo por conteúdo
 5. Extrai os campos conforme o tipo
 6. Registra falhas de extração na fila de treinamento
-7. Grava no banco (upsert_reembolso)
-8. Busca pendentes do cliente por CNPJ
-9. Concilia com o motor
-10. Persiste o resultado
+7. Compara o CNPJ da guia com o do comprovante do cliente
+8. Grava no banco (upsert_reembolso)
+9. Busca pendentes do cliente por CNPJ
+10. Concilia com o motor
+11. Persiste o resultado
 """
 
 import json
@@ -87,17 +88,14 @@ def _e_imagem_embutida(caminho: Path) -> bool:
     """
     if caminho.suffix.lower() not in EXT_IMAGEM:
         return False
-
     nome = caminho.stem.lower()
     if any(nome.startswith(p) or nome == p for p in PREFIXOS_IMAGEM_EMBUTIDA):
         return True
-
     try:
         if caminho.stat().st_size < LIMITE_BYTES_IMAGEM_EMBUTIDA:
             return True
     except OSError:
         pass
-
     return False
 
 
@@ -113,6 +111,44 @@ def _calcular_dias_reembolso(
         return (dc - dj).days
     except (ValueError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# COMPARACAO DE CNPJ
+# ---------------------------------------------------------------------------
+
+
+def comparar_cnpjs(cnpj_guia: str, cnpj_comprovante: str) -> dict:
+    """Compara o CNPJ da guia com o do comprovante do cliente.
+
+    Retorna cnpj_divergente = True (diferentes), False (iguais)
+    ou None (um dos dois nao foi lido).
+    """
+    g = (cnpj_guia or "").strip()
+    c = (cnpj_comprovante or "").strip()
+
+    if not g or not c:
+        return {
+            "cnpj_guia": g,
+            "cnpj_comprovante": c,
+            "cnpj_divergente": None,
+            "motivo_cnpj": "CNPJ nao extraido em um dos documentos",
+        }
+
+    if g == c:
+        return {
+            "cnpj_guia": g,
+            "cnpj_comprovante": c,
+            "cnpj_divergente": False,
+            "motivo_cnpj": "CNPJ confere",
+        }
+
+    return {
+        "cnpj_guia": g,
+        "cnpj_comprovante": c,
+        "cnpj_divergente": True,
+        "motivo_cnpj": f"CNPJ divergente: guia {g} x comprovante {c}",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +179,6 @@ def _registrar_falha(
         },
         "texto": texto,
     }
-
     try:
         with db.cursor() as cur:
             cur.execute(
@@ -154,7 +189,6 @@ def _registrar_falha(
             if cur.fetchone():
                 log.debug("Falha já registrada: %s", caminho.name)
                 return
-
             cur.execute(
                 """INSERT INTO fila_treinamento
                    (tipo_documento, caminho_arquivo, numero_remessa,
@@ -247,7 +281,6 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
                     comp_cliente = campos
                 else:
                     log.info("Comprovante cliente adicional ignorado: %s", arq.name)
-
         except Exception as e:
             log.warning("Erro ao processar %s: %s", arq.name, e)
             desconhecidos.append(arq.name)
@@ -263,13 +296,30 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
             "enfileirados": enfileirados,
         }
 
+    # ------------------------------------------------------------------
+    # Comparacao de CNPJ: guia x comprovante do cliente
+    # ------------------------------------------------------------------
+    cnpj_guia = (guia.get("cnpj") or "").strip()
+    cnpj_comprovante = (
+        (comp_cliente.get("cnpj_pagador") or "").strip() if comp_cliente else ""
+    )
+    comparacao = comparar_cnpjs(cnpj_guia, cnpj_comprovante)
+
+    if comparacao["cnpj_divergente"] is True:
+        log.warning("Remessa %s: %s", remessa, comparacao["motivo_cnpj"])
+
     # Monta o registro para o banco (só colunas que existem no schema)
     registro = {
         "numero_remessa": remessa,
         "numero_nf": guia.get("numero_nf") or None,
+        "tomador": guia.get("tomador") or guia.get("cliente") or None,
         "numero_guia": guia.get("numero_guia") or None,
         "cliente": guia.get("cliente") or None,
         "cnpj_cliente": guia.get("cnpj") or None,
+        "cnpj_guia": comparacao["cnpj_guia"] or None,
+        "cnpj_comprovante": comparacao["cnpj_comprovante"] or None,
+        "cnpj_divergente": comparacao["cnpj_divergente"],
+        "motivo_cnpj": comparacao["motivo_cnpj"],
         "uf": guia.get("uf") or None,
         "tributo": guia.get("tributo") or None,
         "valor_guia": guia.get("valor_guia"),
@@ -314,8 +364,37 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
     resultado = conciliar_remessa(guia, comp_jadlog, comp_cliente, pendentes)
     resultado["numero_remessa"] = remessa
 
-    # Persiste
-    if (resultado.get("lado_cliente") or {}).get("quitados"):
+    # ------------------------------------------------------------------
+    # CNPJ divergente tem prioridade sobre qualquer outro status:
+    # é um erro de identificação do pagador, mais grave que diferença
+    # de valor. Quando um dos CNPJs não foi lido, não dá para confirmar
+    # nem negar — cai para revisão manual.
+    # ------------------------------------------------------------------
+    resultado["cnpj_guia"] = comparacao["cnpj_guia"]
+    resultado["cnpj_comprovante"] = comparacao["cnpj_comprovante"]
+    resultado["cnpj_divergente"] = comparacao["cnpj_divergente"]
+    resultado["motivo_cnpj"] = comparacao["motivo_cnpj"]
+
+    if comparacao["cnpj_divergente"] is True:
+        resultado["status_final"] = "DIVERGENCIA_CNPJ"
+        resultado["score_final"] = 0
+    elif (
+        comparacao["cnpj_divergente"] is None
+        and resultado.get("status_final") == "CONFERIDO"
+    ):
+        resultado["status_final"] = "REVISAO_MANUAL"
+
+    # ------------------------------------------------------------------
+    # Persiste.
+    # A quitação agrupada força CONFERIDO em todos os quitados — o que
+    # mascararia a divergência de CNPJ. Por isso, remessa com CNPJ
+    # divergente sempre passa pelo salvar_resultado, que respeita o
+    # status_final sobrescrito acima.
+    # ------------------------------------------------------------------
+    tem_quitacao_agrupada = bool((resultado.get("lado_cliente") or {}).get("quitados"))
+    cnpj_divergente = comparacao["cnpj_divergente"] is True
+
+    if tem_quitacao_agrupada and not cnpj_divergente:
         ps.salvar_quitacao_agrupada(resultado)
     else:
         ps.salvar_resultado(resultado)
@@ -325,6 +404,7 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
         "remessa": remessa,
         "status": resultado.get("status_final"),
         "score": resultado.get("score_final"),
+        "cnpj_divergente": comparacao["cnpj_divergente"],
         "guia": bool(guia),
         "comp_jadlog": bool(comp_jadlog),
         "comp_cliente": bool(comp_cliente),

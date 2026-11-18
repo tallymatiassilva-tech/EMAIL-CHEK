@@ -6,17 +6,31 @@ from contextlib import contextmanager
 from datetime import datetime
 
 from config import DB_PATH
+from log_manager import get_logger
+
+log = get_logger("database")
 
 _local = threading.local()
 
+# Versão atual do schema. Incremente a cada migração nova.
+VERSAO_SCHEMA = 3
+
+# Tabelas e índices que NÃO dependem de colunas migradas.
+# Índices sobre colunas novas ficam em _criar_indices, que roda depois
+# do _migrar_colunas — senão o CREATE INDEX quebra em bancos antigos.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reembolsos (
     id                          INTEGER PRIMARY KEY AUTOINCREMENT,
     numero_remessa              TEXT NOT NULL UNIQUE,
     numero_nf                   TEXT,
+    tomador                     TEXT,
     numero_guia                 TEXT,
     cliente                     TEXT,
     cnpj_cliente                TEXT,
+    cnpj_guia                   TEXT,
+    cnpj_comprovante            TEXT,
+    cnpj_divergente             INTEGER,
+    motivo_cnpj                 TEXT,
     uf                          TEXT,
     tributo                     TEXT,
     valor_guia                  REAL,
@@ -97,7 +111,42 @@ CREATE TABLE IF NOT EXISTS historico_conciliacao (
 );
 CREATE INDEX IF NOT EXISTS idx_hist_remessa ON historico_conciliacao(numero_remessa);
 CREATE INDEX IF NOT EXISTS idx_hist_data    ON historico_conciliacao(criado_em);
+
+CREATE TABLE IF NOT EXISTS schema_version (
+    versao      INTEGER NOT NULL,
+    aplicada_em TEXT NOT NULL,
+    descricao   TEXT
+);
 """
+
+# Migrações por versão. Cada entrada lista as colunas que aquela versão
+# introduziu. O _migrar_colunas aplica só o que ainda falta.
+MIGRACOES = {
+    1: {
+        "descricao": "valor_reembolso_esperado",
+        "colunas": {"valor_reembolso_esperado": "REAL"},
+    },
+    2: {
+        "descricao": "CNPJ guia x comprovante + tomador",
+        "colunas": {
+            "tomador": "TEXT",
+            "cnpj_guia": "TEXT",
+            "cnpj_comprovante": "TEXT",
+            "cnpj_divergente": "INTEGER",
+            "motivo_cnpj": "TEXT",
+        },
+    },
+    3: {
+        "descricao": "indices de tomador e divergencia",
+        "colunas": {},
+    },
+}
+
+# Índices que dependem de colunas migradas. Criados depois da migração.
+INDICES_POS_MIGRACAO = [
+    "CREATE INDEX IF NOT EXISTS idx_rem_tomador ON reembolsos(tomador)",
+    "CREATE INDEX IF NOT EXISTS idx_rem_div_cnpj ON reembolsos(cnpj_divergente)",
+]
 
 
 def get_conn() -> sqlite3.Connection:
@@ -126,27 +175,100 @@ def cursor():
         cur.close()
 
 
-def _migrar_colunas(conn: sqlite3.Connection) -> None:
-    """Adiciona colunas novas em bancos criados por versões anteriores.
+def versao_atual(conn: sqlite3.Connection) -> int:
+    """Le a ultima versao registrada. Retorna 0 quando nunca migrou."""
+    try:
+        row = conn.execute("SELECT MAX(versao) AS v FROM schema_version").fetchone()
+        return int(row["v"]) if row and row["v"] is not None else 0
+    except sqlite3.OperationalError:
+        return 0
 
-    O CREATE TABLE IF NOT EXISTS não altera tabelas existentes, então
-    colunas adicionadas depois da criação inicial precisam de ALTER TABLE.
+
+def _registrar_versao(conn: sqlite3.Connection, versao: int, descricao: str) -> None:
+    conn.execute(
+        "INSERT INTO schema_version (versao, aplicada_em, descricao) VALUES (?, ?, ?)",
+        (versao, datetime.now().isoformat(timespec="seconds"), descricao),
+    )
+
+
+def _migrar_colunas(conn: sqlite3.Connection) -> None:
+    """Aplica as migracoes pendentes e registra cada versao.
+
+    O CREATE TABLE IF NOT EXISTS nao altera tabelas existentes, entao
+    colunas adicionadas depois da criacao inicial precisam de ALTER TABLE.
+    Cada versao aplicada fica gravada em schema_version.
     """
     existentes = {
         r["name"] for r in conn.execute("PRAGMA table_info(reembolsos)").fetchall()
     }
-    novas = {
-        "valor_reembolso_esperado": "REAL",
-    }
-    for coluna, tipo in novas.items():
-        if coluna not in existentes:
-            conn.execute(f"ALTER TABLE reembolsos ADD COLUMN {coluna} {tipo}")
+    atual = versao_atual(conn)
+
+    if atual >= VERSAO_SCHEMA:
+        log.debug("Schema na versao %d (atual) — nenhuma migracao pendente", atual)
+        return
+
+    log.info("Migrando schema: versao %d -> %d", atual, VERSAO_SCHEMA)
+
+    for versao in sorted(MIGRACOES):
+        if versao <= atual:
+            continue
+
+        migracao = MIGRACOES[versao]
+        criadas = []
+
+        for coluna, tipo in migracao.get("colunas", {}).items():
+            if coluna not in existentes:
+                conn.execute(f"ALTER TABLE reembolsos ADD COLUMN {coluna} {tipo}")
+                existentes.add(coluna)
+                criadas.append(f"{coluna} ({tipo})")
+
+        _registrar_versao(conn, versao, migracao["descricao"])
+
+        if criadas:
+            log.info(
+                "v%d aplicada — colunas criadas: %s",
+                versao,
+                ", ".join(criadas),
+            )
+        else:
+            log.info(
+                "v%d aplicada — %s (nenhuma coluna nova)",
+                versao,
+                migracao["descricao"],
+            )
+
+    log.info("Schema atualizado para a versao %d", VERSAO_SCHEMA)
+
+
+def _criar_indices(conn: sqlite3.Connection) -> None:
+    """Cria os indices que dependem de colunas migradas.
+
+    Roda DEPOIS do _migrar_colunas: um indice sobre coluna inexistente
+    quebra o executescript antes da migracao ter chance de rodar.
+    """
+    criados = []
+    for sql in INDICES_POS_MIGRACAO:
+        try:
+            conn.execute(sql)
+            criados.append(sql.split("idx_rem_")[1].split(" ")[0])
+        except sqlite3.OperationalError as e:
+            log.warning("Falha ao criar indice: %s", e)
+
+    if criados:
+        log.debug("Indices garantidos: %s", ", ".join(criados))
 
 
 def init_db():
+    """Inicializa o banco na ordem correta.
+
+    1. Tabelas e indices que nao dependem de colunas novas
+    2. Colunas migradas (ALTER TABLE)
+    3. Indices sobre as colunas migradas
+    """
     conn = get_conn()
     conn.executescript(SCHEMA)
     _migrar_colunas(conn)
+    _criar_indices(conn)
     conn.commit()
 
 
@@ -191,6 +313,26 @@ def listar_pendentes_por_cnpj(cnpj: str):
         return [dict(r) for r in cur.fetchall()]
 
 
+def listar_divergencias_cnpj():
+    """Remessas com CNPJ divergente entre guia e comprovante."""
+    with cursor() as cur:
+        cur.execute(
+            "SELECT * FROM reembolsos WHERE cnpj_divergente = 1 "
+            "ORDER BY data_atualizacao DESC, id DESC"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def listar_cnpj_nao_lido():
+    """Remessas onde o CNPJ nao foi extraido em um dos documentos."""
+    with cursor() as cur:
+        cur.execute(
+            "SELECT * FROM reembolsos WHERE cnpj_divergente IS NULL "
+            "ORDER BY data_atualizacao DESC, id DESC"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 def listar(filtros: dict | None = None):
     sql = "SELECT * FROM reembolsos WHERE 1=1"
     params = []
@@ -202,6 +344,9 @@ def listar(filtros: dict | None = None):
     if filtros.get("cliente"):
         sql += " AND cliente LIKE ?"
         params.append(f"%{filtros['cliente']}%")
+    if filtros.get("tomador"):
+        sql += " AND tomador LIKE ?"
+        params.append(f"%{filtros['tomador']}%")
     if filtros.get("cnpj"):
         sql += " AND cnpj_cliente LIKE ?"
         params.append(f"%{filtros['cnpj']}%")
@@ -220,6 +365,9 @@ def listar(filtros: dict | None = None):
     if filtros.get("data_fim"):
         sql += " AND data_pagamento_jadlog <= ?"
         params.append(filtros["data_fim"])
+    if filtros.get("cnpj_divergente") is not None:
+        sql += " AND cnpj_divergente = ?"
+        params.append(1 if filtros["cnpj_divergente"] else 0)
 
     sql += " ORDER BY data_pagamento_jadlog DESC, id DESC"
     with cursor() as cur:

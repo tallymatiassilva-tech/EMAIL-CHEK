@@ -2,8 +2,11 @@
 
 Gera um arquivo .xlsx com:
 - Aba "Reembolsos": todos os registros com status, score e valores
-- Aba "Divergências": apenas os que precisam de revisão
-- Aba "Resumo": contagens por status e por camada
+- Aba "Divergências": status críticos + qualquer CNPJ divergente
+- Aba "Resumo": contagens por status, por camada e de CNPJ
+
+Colunas novas: tomador (logo após NF), cnpj_guia, cnpj_comprovante
+e cnpj_divergente.
 """
 
 from datetime import datetime
@@ -30,6 +33,10 @@ STATUS_CRITICOS = {
 COLUNAS = [
     ("numero_remessa", "Remessa", 16),
     ("numero_nf", "NF", 12),
+    ("tomador", "Tomador", 38),
+    ("cnpj_guia", "CNPJ Guia", 20),
+    ("cnpj_comprovante", "CNPJ Comprovante", 20),
+    ("cnpj_divergente", "CNPJ Divergente", 16),
     ("numero_guia", "Guia", 18),
     ("cliente", "Cliente", 32),
     ("cnpj_cliente", "CNPJ", 20),
@@ -48,13 +55,34 @@ COLUNAS = [
     ("data_atualizacao", "Atualizado em", 20),
 ]
 
+# Tradução do indicador de divergência de CNPJ
+MAPA_DIVERGENCIA = {
+    True: "SIM",
+    False: "NAO",
+    1: "SIM",
+    0: "NAO",
+    "True": "SIM",
+    "False": "NAO",
+    None: "NAO LIDO",
+    "": "NAO LIDO",
+}
+
+
+def _valor_celula(registro: dict, campo: str):
+    """Extrai o valor de um campo, tratando o indicador de divergência."""
+    valor = registro.get(campo)
+
+    if campo == "cnpj_divergente":
+        if valor is None or valor == "":
+            return "NAO LIDO"
+        return MAPA_DIVERGENCIA.get(valor, "NAO LIDO")
+
+    return valor if valor is not None else ""
+
 
 def _linhas_para_excel(registros: list[dict]) -> list[list]:
     """Converte os registros do banco em linhas de planilha."""
-    return [
-        [r.get(campo) if r.get(campo) is not None else "" for campo, _, _ in COLUNAS]
-        for r in registros
-    ]
+    return [[_valor_celula(r, campo) for campo, _, _ in COLUNAS] for r in registros]
 
 
 def _escrever_cabecalho(ws, cor: str):
@@ -72,16 +100,52 @@ def _escrever_cabecalho(ws, cor: str):
 
 def _escrever_dados(ws, registros: list[dict]):
     """Escreve as linhas de dados com formatação de valor."""
-    from openpyxl.styles import Alignment
+    from openpyxl.styles import Alignment, PatternFill
+
+    vermelho = PatternFill("solid", fgColor="FFC7CE")
 
     for row_idx, linha in enumerate(_linhas_para_excel(registros), 2):
         for col_idx, valor in enumerate(linha, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=valor)
             campo = COLUNAS[col_idx - 1][0]
+
             if campo.startswith("valor_"):
                 cell.number_format = "R$ #,##0.00"
             elif campo == "score":
                 cell.alignment = Alignment(horizontal="center")
+            elif campo == "cnpj_divergente":
+                cell.alignment = Alignment(horizontal="center")
+                if valor == "SIM":
+                    cell.fill = vermelho
+
+
+def _e_divergente(registro: dict) -> bool:
+    """Remessa que precisa de atencao: status critico OU CNPJ divergente."""
+    if registro.get("status") in STATUS_CRITICOS:
+        return True
+    return registro.get("cnpj_divergente") in (True, 1, "True")
+
+
+def _contar_cnpj(registros: list[dict]) -> tuple[int, int]:
+    """Conta CNPJ divergente e nao lido.
+
+    Usa as funcoes do database quando disponiveis; cai para contagem
+    em memoria se a consulta falhar.
+    """
+    try:
+        return len(db.listar_divergencias_cnpj()), len(db.listar_cnpj_nao_lido())
+    except Exception:
+        div = len(
+            [r for r in registros if r.get("cnpj_divergente") in (True, 1, "True")]
+        )
+        nao_lido = len(
+            [
+                r
+                for r in registros
+                if r.get("cnpj_divergente") is None or r.get("cnpj_divergente") == ""
+            ]
+        )
+        return div, nao_lido
 
 
 def exportar(caminho_destino: str | Path | None = None) -> Path:
@@ -118,8 +182,10 @@ def exportar(caminho_destino: str | Path | None = None) -> Path:
 
     # ------------------------------------------------------------------
     # ABA 2: DIVERGÊNCIAS
+    # Inclui os status críticos E qualquer remessa com CNPJ divergente,
+    # mesmo que o status final tenha sido outro.
     # ------------------------------------------------------------------
-    criticos = [r for r in registros if r.get("status") in STATUS_CRITICOS]
+    criticos = [r for r in registros if _e_divergente(r)]
     ws2 = wb.create_sheet("Divergências")
     _escrever_cabecalho(ws2, "C00000")
     _escrever_dados(ws2, criticos)
@@ -138,9 +204,17 @@ def exportar(caminho_destino: str | Path | None = None) -> Path:
     ws3["A3"] = "Total de reembolsos"
     ws3["B3"] = len(registros)
 
-    ws3["A5"] = "Por status"
-    ws3["A5"].font = Font(bold=True)
-    row = 6
+    div_cnpj, nao_lido = _contar_cnpj(registros)
+    ws3["A4"] = "CNPJ divergente"
+    ws3["B4"] = div_cnpj
+    ws3["A5"] = "CNPJ nao lido"
+    ws3["B5"] = nao_lido
+    ws3["A6"] = "Na aba Divergências"
+    ws3["B6"] = len(criticos)
+
+    ws3["A8"] = "Por status"
+    ws3["A8"].font = Font(bold=True)
+    row = 9
     for status, qtd in sorted(
         ps.estatisticas_por_status().items(), key=lambda x: -x[1]
     ):

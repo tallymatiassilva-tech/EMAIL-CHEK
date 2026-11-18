@@ -1,7 +1,12 @@
-"""Extração de campos estruturados por tipo de documento.
+"""Extracao de campos estruturados por tipo de documento.
+
 Etapa 5: consulta o cache de layouts por hash antes de tentar todos os
-rótulos. Se o formato já foi visto, usa os rótulos que funcionaram.
+rotulos. Se o formato ja foi visto, usa os rotulos que funcionaram.
+
+Inclui extracao de CNPJ da guia (contribuinte) e do comprovante (pagador),
+alem da razao social do tomador na guia.
 """
+
 import re
 from pathlib import Path
 
@@ -9,7 +14,7 @@ import layout_cache
 from config import TipoDoc
 from log_manager import get_logger
 from ocr_engine import extrair_texto
-from utils import normalizar_cnpj, parse_data, parse_valor
+from utils import normalizar_cnpj, parse_data, parse_valor, validar_cnpj
 from valor_tolerante import valor_tolerante
 
 log = get_logger("pdf_reader")
@@ -40,6 +45,22 @@ BANCOS = (
     "MERCANTIL",
 )
 
+# Orgaos que costumam aparecer na guia e NAO sao o contribuinte.
+# O CNPJ deles nunca deve ser escolhido como CNPJ da guia.
+CNPJS_A_IGNORAR = (
+    "BANCO DO BRASIL",
+    "CAIXA ECONOMICA",
+    "PREFEITURA",
+    "SECRETARIA",
+    "FAZENDA",
+    "RECEITA FEDERAL",
+    "SEFAZ",
+    "TESOURO",
+    "ITAU",
+    "BRADESCO",
+    "SANTANDER",
+)
+
 ROTULOS_VALOR_GENERICOS = [
     r"valor\s*(?:do\s*)?(?:documento|pagamento|pago|total|l[ií]quido|bruto)",
     r"total\s*(?:a\s*pagar|pago|do\s*documento)?",
@@ -54,27 +75,208 @@ ROTULOS_DATA_GENERICOS = [
     r"data",
 ]
 
-# Rótulos que NÃO são regex: nunca devem ser gravados no cache nem usados
-# como chave de busca. "fallback" e "tolerante" são marcadores internos.
-ROTULOS_INVALIDOS = {"fallback", "tolerante", ""}
+# Rotulos que identificam o CNPJ do contribuinte na guia.
+# Ordem importa: os mais especificos primeiro.
+ROTULOS_CNPJ_GUIA = [
+    r"cnpj\s*(?:do\s*)?contribuinte",
+    r"cnpj\s*(?:do\s*)?(?:destinat[aá]rio|tomador|devedor)",
+    r"cpf\s*/?\s*cnpj\s*(?:do\s*)?(?:contribuinte|destinat[aá]rio|tomador)",
+    r"contribuinte\s*[:.]?\s*(?:cnpj|cpf)",
+    r"inscri[çc][ãa]o\s*(?:estadual|no\s*estado)",
+    r"cnpj\s*[:.]?\s*",
+    r"cpf\s*/?\s*cnpj",
+    r"raz[ãa]o\s*social",
+    r"nome\s*(?:do\s*)?(?:contribuinte|destinat[aá]rio|tomador)",
+]
+
+# Rotulos que identificam o CNPJ do pagador no comprovante do cliente.
+ROTULOS_CNPJ_PAGADOR = [
+    r"cnpj\s*(?:do\s*)?pagador",
+    r"pagador\s*[:.]?\s*(?:cnpj)?",
+    r"origem",
+    r"debitad[oa]",
+]
+
+# Rotulos que identificam a razao social / tomador na guia.
+ROTULOS_RAZAO_SOCIAL = [
+    r"raz[ãa]o\s*social",
+    r"nome\s*(?:do\s*)?(?:contribuinte|destinat[aá]rio|tomador)",
+    r"contribuinte",
+    r"tomador\s*(?:de\s*servi[çc]os)?",
+    r"destinat[aá]rio",
+]
+
+# Mapa de caracteres que o OCR confunde com frequencia.
+MAPA_OCR = str.maketrans(
+    {
+        "O": "0",
+        "o": "0",
+        "I": "1",
+        "l": "1",
+        "|": "1",
+        "S": "5",
+        "s": "5",
+        "B": "8",
+        "Z": "2",
+        "z": "2",
+        "G": "6",
+    }
+)
 
 
-def _primeiro_cnpj(texto: str) -> str:
-    m = RE_CNPJ.search(texto)
-    return normalizar_cnpj(m.group(0)) if m else ""
+# ---------------------------------------------------------------------------
+# VALIDACAO DE CNPJ (usa o validar_cnpj do utils)
+# ---------------------------------------------------------------------------
 
 
-def _cnpj_apos_rotulo(texto: str, rotulos: list[str]) -> str:
-    for rotulo in rotulos:
-        padrao = rf"{rotulo}[\s\S]{{0,200}}?({RE_CNPJ.pattern})"
-        m = re.search(padrao, texto, re.IGNORECASE)
-        if m:
-            return normalizar_cnpj(m.group(1))
+def _corrigir_ocr_cnpj(texto: str) -> str:
+    """Corrige caracteres que o OCR confunde por digitos."""
+    return texto.translate(MAPA_OCR)
+
+
+def _cnpj_valido(texto: str) -> str:
+    """Normaliza e valida. Retorna o CNPJ limpo ou string vazia.
+
+    Usa o validar_cnpj do utils como fonte unica de verdade. Se o
+    normalizar_cnpj devolver vazio (menos de 14 digitos), ja descarta.
+    """
+    cnpj = normalizar_cnpj(texto)
+    if cnpj and validar_cnpj(cnpj):
+        return cnpj
+
+    # segunda tentativa: corrigindo confusoes do OCR
+    corrigido = normalizar_cnpj(_corrigir_ocr_cnpj(texto))
+    if corrigido and validar_cnpj(corrigido):
+        return corrigido
+
     return ""
 
 
+# ---------------------------------------------------------------------------
+# HELPERS DE EXTRACAO
+# ---------------------------------------------------------------------------
+
+
+def _primeiro_cnpj(texto: str) -> str:
+    """Primeiro CNPJ valido do texto."""
+    for m in RE_CNPJ.finditer(texto):
+        cnpj = _cnpj_valido(m.group(0))
+        if cnpj:
+            return cnpj
+    return ""
+
+
+def _cnpj_apos_rotulo(texto: str, rotulos: list[str]) -> str:
+    """CNPJ valido que aparece depois de um dos rotulos."""
+    for rotulo in rotulos:
+        padrao = rf"{rotulo}[\s\S]{{0,200}}?({RE_CNPJ.pattern})"
+        for m in re.finditer(padrao, texto, re.IGNORECASE):
+            cnpj = _cnpj_valido(m.group(1))
+            if cnpj:
+                return cnpj
+    return ""
+
+
+def _razao_social_apos_rotulo(texto: str, rotulos: list[str]) -> str:
+    """Extrai a razao social que aparece depois de um rotulo."""
+    for rotulo in rotulos:
+        padrao = rf"{rotulo}[\s:.\-]*\n?\s*([A-ZÀ-Ú0-9][A-ZÀ-Ú0-9&\s.\-/]{{4,90}})"
+        m = re.search(padrao, texto, re.IGNORECASE)
+        if m:
+            nome = re.sub(r"\s+", " ", m.group(1)).strip(" .-")
+            if len(nome) >= 4:
+                return nome
+    return ""
+
+
+def _cnpj_por_proximidade_nome(texto: str, nome: str) -> str:
+    """CNPJ que aparece perto do nome do tomador.
+
+    Usado quando o rotulo do CNPJ nao foi encontrado, mas a razao social
+    foi. Na guia, o CNPJ do contribuinte fica sempre perto do nome dele.
+    """
+    if not nome:
+        return ""
+    nome_re = re.escape(nome[:40])
+    padrao = rf"{nome_re}[\s\S]{{0,300}}?({RE_CNPJ.pattern})"
+    for m in re.finditer(padrao, texto, re.IGNORECASE):
+        cnpj = _cnpj_valido(m.group(1))
+        if cnpj:
+            return cnpj
+    return ""
+
+
+def _cnpj_nao_e_orgao(cnpj: str, texto: str) -> bool:
+    """Verifica se o CNPJ esta associado a um orgao publico ou banco.
+
+    Evita pegar o CNPJ da prefeitura, da SEFAZ ou do banco que emitiu
+    a guia em vez do CNPJ do contribuinte.
+    """
+    if not cnpj:
+        return True
+    pos = texto.find(cnpj)
+    if pos < 0:
+        fmt = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+        pos = texto.find(fmt)
+    if pos < 0:
+        return True
+
+    # janela de 120 chars antes do CNPJ
+    inicio = max(0, pos - 120)
+    contexto = texto[inicio:pos].upper()
+    return not any(orgao in contexto for orgao in CNPJS_A_IGNORAR)
+
+
+def _cnpj_guia(texto: str, nome_tomador: str = "") -> str:
+    """CNPJ do contribuinte na guia, com cascata de estrategias.
+
+    Ordem:
+    1. Rotulo especifico (contribuinte, destinatario, tomador)
+    2. Proximidade do nome do tomador
+    3. Primeiro CNPJ valido que nao seja de orgao publico/banco
+    4. Primeiro CNPJ valido do texto
+    """
+    # 1. rotulo
+    cnpj = _cnpj_apos_rotulo(texto, ROTULOS_CNPJ_GUIA)
+    if cnpj and _cnpj_nao_e_orgao(cnpj, texto):
+        return cnpj
+
+    # 2. proximidade do nome
+    cnpj = _cnpj_por_proximidade_nome(texto, nome_tomador)
+    if cnpj and _cnpj_nao_e_orgao(cnpj, texto):
+        return cnpj
+
+    # 3. primeiro valido que nao seja orgao
+    for m in RE_CNPJ.finditer(texto):
+        cnpj = _cnpj_valido(m.group(0))
+        if cnpj and _cnpj_nao_e_orgao(cnpj, texto):
+            return cnpj
+
+    # 4. primeiro valido
+    return _primeiro_cnpj(texto)
+
+
+def _cnpj_pagador_comprovante(texto: str, nome_pagador: str) -> str:
+    """CNPJ do pagador no comprovante, com tres tentativas."""
+    if nome_pagador:
+        linha = re.search(
+            rf"{re.escape(nome_pagador)}[^\n]{{0,80}}({RE_CNPJ.pattern})",
+            texto,
+        )
+        if linha:
+            cnpj = _cnpj_valido(linha.group(1))
+            if cnpj:
+                return cnpj
+
+    cnpj = _cnpj_apos_rotulo(texto, ROTULOS_CNPJ_PAGADOR)
+    if cnpj:
+        return cnpj
+
+    return _primeiro_cnpj(texto)
+
+
 def _valor_apos_rotulo(texto: str, rotulos: list[str]) -> tuple[float | None, str]:
-    """Retorna (valor, rótulo que casou). O rótulo é usado para o cache."""
+    """Retorna (valor, rotulo que casou). O rotulo e usado para o cache."""
     for rotulo in rotulos:
         padrao = rf"{rotulo}[\s\S]{{0,150}}?{RE_VALOR_BRL.pattern}"
         m = re.search(padrao, texto, re.IGNORECASE)
@@ -86,7 +288,7 @@ def _valor_apos_rotulo(texto: str, rotulos: list[str]) -> tuple[float | None, st
 
 
 def _data_apos_rotulo(texto: str, rotulos: list[str]) -> tuple[str | None, str]:
-    """Retorna (data, rótulo que casou). O rótulo é usado para o cache."""
+    """Retorna (data, rotulo que casou). O rotulo e usado para o cache."""
     for rotulo in rotulos:
         padrao = rf"{rotulo}[\s\S]{{0,150}}?{RE_DATA_BR.pattern}"
         m = re.search(padrao, texto, re.IGNORECASE)
@@ -117,13 +319,8 @@ def _data_fallback(texto: str) -> str | None:
 def _valor_com_cache(
     texto: str, rotulos: list[str], rotulo_cache: str | None
 ) -> tuple[float | None, str]:
-    """Consulta o cache primeiro; se falhar, cai na cascata normal.
-
-    CORREÇÃO: não chama mais _valor_fallback internamente. Se nenhum rótulo
-    casar, retorna (None, "") para que o chamador decida a próxima camada
-    (valor_tolerante antes do fallback genérico).
-    """
-    if rotulo_cache and rotulo_cache not in ROTULOS_INVALIDOS:
+    """Consulta o cache primeiro; se falhar, cai na cascata normal."""
+    if rotulo_cache:
         v, _ = _valor_apos_rotulo(texto, [rotulo_cache])
         if v is not None:
             return v, rotulo_cache
@@ -133,14 +330,14 @@ def _valor_com_cache(
     v, r = _valor_apos_rotulo(texto, ROTULOS_VALOR_GENERICOS)
     if v is not None:
         return v, r
-    return None, ""
+    return _valor_fallback(texto), ""
 
 
 def _data_com_cache(
     texto: str, rotulos: list[str], rotulo_cache: str | None
 ) -> tuple[str | None, str]:
     """Consulta o cache primeiro; se falhar, cai na cascata normal."""
-    if rotulo_cache and rotulo_cache not in ROTULOS_INVALIDOS:
+    if rotulo_cache:
         d, _ = _data_apos_rotulo(texto, [rotulo_cache])
         if d is not None:
             return d, rotulo_cache
@@ -167,16 +364,25 @@ def _extrair_nf(texto: str) -> str:
     return m.group(1) if m else ""
 
 
+# ---------------------------------------------------------------------------
+# GUIA
+# ---------------------------------------------------------------------------
+
+
 def extrair_guia(caminho: Path) -> dict:
     texto = extrair_texto(caminho)
     cache = layout_cache.buscar_layout(TipoDoc.GUIA, texto) or {}
     rotulos_usados = {}
 
+    # Razao social primeiro: o CNPJ pode ser achado por proximidade dela.
+    razao = _razao_social_apos_rotulo(texto, ROTULOS_RAZAO_SOCIAL)
+
     campos = {
         "numero_guia": "",
         "numero_nf": _extrair_nf(texto),
-        "cliente": "",
-        "cnpj": _primeiro_cnpj(texto),
+        "cliente": razao,
+        "tomador": razao,
+        "cnpj": _cnpj_guia(texto, razao),
         "uf": "",
         "tributo": "",
         "valor_guia": None,
@@ -185,6 +391,9 @@ def extrair_guia(caminho: Path) -> dict:
         "chave_nfe": "",
     }
     confianca = 0
+
+    if razao:
+        confianca += 10
 
     m = re.search(
         r"chave\s*(?:de\s*)?acesso[:\s]*([\d\s]{44,60})", texto, re.IGNORECASE
@@ -226,16 +435,18 @@ def extrair_guia(caminho: Path) -> dict:
     campos["valor_guia"] = valor
     if valor:
         confianca += 20
-        if rotulo and rotulo not in ROTULOS_INVALIDOS:
+        if rotulo:
             rotulos_usados["valor_guia"] = rotulo
 
     data_em, rotulo = _data_com_cache(
-        texto, [r"data\s*emiss[ãa]o", r"emiss[ãa]o"], cache.get("data_emissao")
+        texto,
+        [r"data\s*emiss[ãa]o", r"emiss[ãa]o"],
+        cache.get("data_emissao"),
     )
     campos["data_emissao"] = data_em
     if data_em:
         confianca += 10
-        if rotulo and rotulo not in ROTULOS_INVALIDOS:
+        if rotulo:
             rotulos_usados["data_emissao"] = rotulo
 
     data_venc, rotulo = _data_com_cache(
@@ -246,7 +457,7 @@ def extrair_guia(caminho: Path) -> dict:
     campos["data_vencimento"] = data_venc
     if data_venc:
         confianca += 10
-        if rotulo and rotulo not in ROTULOS_INVALIDOS:
+        if rotulo:
             rotulos_usados["data_vencimento"] = rotulo
 
     if campos["numero_nf"]:
@@ -260,8 +471,12 @@ def extrair_guia(caminho: Path) -> dict:
 
     if not cache and rotulos_usados:
         layout_cache.gravar_layout(TipoDoc.GUIA, texto, campos, rotulos_usados)
-
     return campos
+
+
+# ---------------------------------------------------------------------------
+# COMPROVANTE JADLOG
+# ---------------------------------------------------------------------------
 
 
 def extrair_comprovante_jadlog(caminho: Path) -> dict:
@@ -309,7 +524,9 @@ def extrair_comprovante_jadlog(caminho: Path) -> dict:
         confianca += 10
 
     m = re.search(
-        r"(?:documento|n[ºo]\s*doc)[:\s]*([\w.\-/]{4,30})", texto, re.IGNORECASE
+        r"(?:documento|n[ºo]\s*doc)[:\s]*([\w.\-/]{4,30})",
+        texto,
+        re.IGNORECASE,
     )
     if m:
         campos["numero_documento"] = m.group(1)
@@ -323,18 +540,23 @@ def extrair_comprovante_jadlog(caminho: Path) -> dict:
     campos["data_pagamento_jadlog"] = data
     if data:
         confianca += 15
-        if rotulo and rotulo not in ROTULOS_INVALIDOS:
+        if rotulo:
             rotulos_usados["data_pagamento_jadlog"] = rotulo
 
     valor, rotulo = _valor_com_cache(
         texto,
-        [r"valor\s*do\s*documento", r"valor\s*pago", r"valor\s*total", r"valor"],
+        [
+            r"valor\s*do\s*documento",
+            r"valor\s*pago",
+            r"valor\s*total",
+            r"valor",
+        ],
         cache.get("valor_pago_jadlog"),
     )
     campos["valor_pago_jadlog"] = valor
     if valor:
         confianca += 20
-        if rotulo and rotulo not in ROTULOS_INVALIDOS:
+        if rotulo:
             rotulos_usados["valor_pago_jadlog"] = rotulo
 
     campos["confianca"] = min(confianca, 100)
@@ -343,8 +565,12 @@ def extrair_comprovante_jadlog(caminho: Path) -> dict:
 
     if not cache and rotulos_usados:
         layout_cache.gravar_layout(TipoDoc.COMP_JADLOG, texto, campos, rotulos_usados)
-
     return campos
+
+
+# ---------------------------------------------------------------------------
+# COMPROVANTE CLIENTE
+# ---------------------------------------------------------------------------
 
 
 def extrair_comprovante_cliente(caminho: Path) -> dict:
@@ -374,22 +600,10 @@ def extrair_comprovante_cliente(caminho: Path) -> dict:
         campos["nome_pagador"] = m.group(1).strip()
         confianca += 10
 
-    cnpj_pag = ""
-    if campos["nome_pagador"]:
-        linha = re.search(
-            rf"{re.escape(campos['nome_pagador'])}[^\n]{{0,80}}({RE_CNPJ.pattern})",
-            texto,
-        )
-        if linha:
-            cnpj_pag = normalizar_cnpj(linha.group(1))
-    campos["cnpj_pagador"] = cnpj_pag
+    campos["cnpj_pagador"] = _cnpj_pagador_comprovante(texto, campos["nome_pagador"])
     if campos["cnpj_pagador"]:
         confianca += 25
 
-    # --- VALOR: cascata corrigida ---
-    # 1) cache + rótulos explícitos (sem fallback interno)
-    # 2) valor_tolerante (corrige OCR corrompido: "38*º" -> 38,00)
-    # 3) _valor_fallback (último recurso)
     valor, rotulo = _valor_com_cache(
         texto, [r"valor\s*pago", r"valor"], cache.get("valor_reembolso")
     )
@@ -403,7 +617,7 @@ def extrair_comprovante_cliente(caminho: Path) -> dict:
     campos["valor_reembolso"] = valor
     if valor:
         confianca += 25
-    if rotulo and rotulo not in ROTULOS_INVALIDOS:
+    if rotulo and rotulo not in ("fallback", "tolerante"):
         rotulos_usados["valor_reembolso"] = rotulo
 
     data, rotulo = _data_com_cache(
@@ -418,7 +632,7 @@ def extrair_comprovante_cliente(caminho: Path) -> dict:
     campos["data_reembolso"] = data
     if data:
         confianca += 15
-        if rotulo and rotulo not in ROTULOS_INVALIDOS:
+        if rotulo:
             rotulos_usados["data_reembolso"] = rotulo
 
     up = texto.upper()
@@ -451,8 +665,12 @@ def extrair_comprovante_cliente(caminho: Path) -> dict:
 
     if not cache and rotulos_usados:
         layout_cache.gravar_layout(TipoDoc.COMP_CLIENTE, texto, campos, rotulos_usados)
-
     return campos
+
+
+# ---------------------------------------------------------------------------
+# DISPATCH
+# ---------------------------------------------------------------------------
 
 
 def extrair_por_tipo(caminho: Path, tipo: str) -> dict:

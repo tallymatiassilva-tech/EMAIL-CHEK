@@ -13,8 +13,15 @@ def apenas_digitos(texto: str) -> str:
 
 
 def normalizar_cnpj(cnpj: str) -> str:
+    """Remove tudo que nao for digito.
+
+    Retorna '' quando o resultado nao tem exatamente 14 digitos.
+    O zfill(14) anterior transformava CPF (11 digitos) e numeros
+    truncados pelo OCR em CNPJ falso de 14 digitos, o que contaminava
+    a comparacao guia x comprovante em todo o fluxo.
+    """
     d = apenas_digitos(cnpj)
-    return d.zfill(14) if d else ""
+    return d if len(d) == 14 else ""
 
 
 def formatar_cnpj(cnpj: str) -> str:

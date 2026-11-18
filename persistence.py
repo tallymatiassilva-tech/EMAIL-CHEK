@@ -56,6 +56,21 @@ def _agora() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _motivo(resultado: dict, lado_cliente: dict) -> str | None:
+    """Escolhe o motivo mais informativo para o histórico.
+
+    Prioridade:
+    1. motivo_cnpj — divergência de CNPJ (mais grave, mais específico)
+    2. lado_cliente.motivo — motivo do motor de conciliação
+    3. resultado.motivo — motivo genérico
+    """
+    return (
+        resultado.get("motivo_cnpj")
+        or lado_cliente.get("motivo")
+        or resultado.get("motivo")
+    )
+
+
 # ---------------------------------------------------------------------------
 # GRAVAÇÃO DO RESULTADO
 # ---------------------------------------------------------------------------
@@ -111,6 +126,16 @@ def salvar_resultado(resultado: dict) -> dict:
     if lado_cliente.get("valor_comprovante") and not valor_quitado:
         campos["valor_reembolso_cliente"] = lado_cliente["valor_comprovante"]
 
+    # Campos de CNPJ, quando o pipeline os enviou
+    for campo_cnpj in (
+        "cnpj_guia",
+        "cnpj_comprovante",
+        "cnpj_divergente",
+        "motivo_cnpj",
+    ):
+        if campo_cnpj in resultado:
+            campos[campo_cnpj] = resultado[campo_cnpj]
+
     sets = ",".join(f"{k}=?" for k in campos)
     with cursor() as cur:
         cur.execute(
@@ -135,7 +160,7 @@ def salvar_resultado(resultado: dict) -> dict:
                 camada,
                 valor_quitado,
                 diferenca,
-                lado_cliente.get("motivo") or resultado.get("motivo"),
+                _motivo(resultado, lado_cliente),
                 _agora(),
             ),
         )
@@ -166,7 +191,11 @@ def salvar_resultado(resultado: dict) -> dict:
 
 
 def salvar_quitacao_agrupada(resultado: dict) -> dict:
-    """Quando um comprovante quita N reembolsos, atualiza todos de uma vez."""
+    """Quando um comprovante quita N reembolsos, atualiza todos de uma vez.
+
+    Remessas com CNPJ divergente NUNCA entram aqui: o pipeline as desvia
+    para salvar_resultado, que respeita o status DIVERGENCIA_CNPJ.
+    """
     _garantir_historico()
 
     lado_cliente = resultado.get("lado_cliente") or {}

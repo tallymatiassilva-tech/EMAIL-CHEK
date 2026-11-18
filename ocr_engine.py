@@ -1,14 +1,28 @@
-"""Extração de texto: nativo -> OCR fallback, com cache de layout."""
+"""Motor de OCR: extrai texto de PDFs e imagens.
 
-import os
-from collections import OrderedDict
+Estrategia:
+1. PDF com camada de texto: usa o texto direto (mais rapido e exato).
+2. PDF sem camada de texto (escaneado): rasteriza e passa pelo Tesseract.
+3. Imagem: passa direto pelo Tesseract.
+
+Pre-processamento antes do OCR:
+- Escala de cinza
+- Binarizacao adaptativa (melhor que threshold fixo em documento amarelado)
+- Remocao de ruido leve
+- Upscale quando a imagem e pequena
+
+Pos-processamento do texto:
+- Corrige caracteres que o Tesseract confunde em contexto de CNPJ/valor
+- Normaliza espacos e quebras de linha
+- Remove caracteres de controle
+"""
+
+import hashlib
+import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
-
-import cv2
-import numpy as np
-import pdfplumber
-import pytesseract
-from pdf2image import convert_from_path
 
 from config import (
     OCR_CACHE_MAX,
@@ -19,88 +33,14 @@ from config import (
     TESSERACT_LANG,
 )
 from log_manager import get_logger
-from utils import hash_layout
 
 log = get_logger("ocr")
 
-# ---------------------------------------------------------------------------
-# CONFIGURAÇÃO DO TESSERACT
-# ---------------------------------------------------------------------------
+# Cache em memoria: hash do arquivo -> texto extraido.
+# Evita repetir OCR do mesmo arquivo quando o pipeline roda varias vezes.
+_CACHE: dict[str, str] = {}
 
-try:
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-except Exception as e:
-    log.warning("Não foi possível definir tesseract_cmd: %s", e)
-
-
-def _montar_config_tessdata() -> str:
-    """Define TESSDATA_PREFIX em vez de --tessdata-dir.
-
-    No Windows o pytesseract quebra o caminho do --tessdata-dir em
-    '...tessdata"/por.traineddata'. TESSDATA_PREFIX evita o problema
-    porque o Tesseract resolve o tessdata sozinho a partir da variável.
-    """
-    caminho = str(TESSDATA_DIR).strip().strip('"').strip("'").rstrip("\\/")
-    os.environ["TESSDATA_PREFIX"] = caminho
-    return ""
-
-
-_TESSERACT_CONFIG = _montar_config_tessdata()
-
-
-def _verificar_tesseract() -> bool:
-    """Testa o Tesseract fazendo um OCR real numa imagem sintética.
-
-    Não usa get_languages(): nessa versão do pytesseract ele não repassa
-    o --tessdata-dir e devolve lista vazia mesmo com o OCR funcionando.
-    """
-    try:
-        versao = pytesseract.get_tesseract_version()
-        log.info("Tesseract %s em %s", versao, TESSERACT_CMD)
-    except Exception as e:
-        log.warning("Tesseract indisponível (%s): %s", TESSERACT_CMD, e)
-        return False
-
-    # Imagem sintética com texto conhecido
-    try:
-        teste = np.full((80, 400, 3), 255, dtype=np.uint8)
-        cv2.putText(
-            teste,
-            "TESTE 123",
-            (10, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.5,
-            (0, 0, 0),
-            3,
-        )
-        texto = pytesseract.image_to_string(
-            teste,
-            lang=TESSERACT_LANG,
-            config=_TESSERACT_CONFIG,
-        )
-    except Exception as e:
-        log.warning(
-            "OCR de teste falhou (idioma '%s' em %s): %s",
-            TESSERACT_LANG,
-            TESSDATA_DIR,
-            e,
-        )
-        return False
-
-    if not texto.strip():
-        log.warning(
-            "OCR de teste não retornou texto. Idioma '%s' pode estar "
-            "indisponível em %s",
-            TESSERACT_LANG,
-            TESSDATA_DIR,
-        )
-        return False
-
-    log.info("Idioma '%s' operacional para OCR", TESSERACT_LANG)
-    return True
-
-
-TESSERACT_OK = _verificar_tesseract()
+EXT_IMAGEM = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif"}
 
 
 # ---------------------------------------------------------------------------
@@ -108,39 +48,104 @@ TESSERACT_OK = _verificar_tesseract()
 # ---------------------------------------------------------------------------
 
 
-class _CacheLRU:
-    def __init__(self, maxsize):
-        self.maxsize = maxsize
-        self._d = OrderedDict()
-
-    def get(self, k):
-        if k in self._d:
-            self._d.move_to_end(k)
-            return self._d[k]
-        return None
-
-    def put(self, k, v):
-        self._d[k] = v
-        self._d.move_to_end(k)
-        if len(self._d) > self.maxsize:
-            self._d.popitem(last=False)
+def _hash_arquivo(caminho: Path) -> str:
+    """Hash do conteudo do arquivo (nao do nome)."""
+    h = hashlib.sha256()
+    with open(caminho, "rb") as f:
+        for bloco in iter(lambda: f.read(65536), b""):
+            h.update(bloco)
+    return h.hexdigest()
 
 
-_cache_texto = _CacheLRU(OCR_CACHE_MAX)
+def _cache_get(chave: str) -> str | None:
+    return _CACHE.get(chave)
+
+
+def _cache_set(chave: str, texto: str) -> None:
+    if len(_CACHE) >= OCR_CACHE_MAX:
+        # remove o mais antigo (dict preserva ordem de insercao)
+        _CACHE.pop(next(iter(_CACHE)), None)
+    _CACHE[chave] = texto
 
 
 # ---------------------------------------------------------------------------
-# PRÉ-PROCESSAMENTO
+# PRE-PROCESSAMENTO DE IMAGEM
 # ---------------------------------------------------------------------------
 
 
-def _preprocessar(img):
-    """Binarização + denoise para melhorar OCR."""
-    arr = np.array(img)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY) if arr.ndim == 3 else arr
-    gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return th
+def _preprocessar_imagem(caminho: Path) -> Path:
+    """Prepara a imagem para o OCR.
+
+    Converte para escala de cinza, aplica binarizacao adaptativa e faz
+    upscale quando a imagem e pequena. Documento fiscal escaneado em
+    papel amarelado melhora muito com binarizacao adaptativa.
+    """
+    try:
+        from PIL import Image, ImageFilter, ImageOps
+    except ImportError:
+        log.warning("Pillow nao instalado — OCR sem pre-processamento")
+        return caminho
+
+    try:
+        img = Image.open(caminho)
+        img = ImageOps.exif_transpose(img)
+
+        # escala de cinza
+        if img.mode != "L":
+            img = img.convert("L")
+
+        # upscale quando a imagem e pequena (melhora muito o OCR)
+        largura_min = 1600
+        if img.width < largura_min:
+            fator = largura_min / img.width
+            nova = (int(img.width * fator), int(img.height * fator))
+            img = img.resize(nova, Image.LANCZOS)
+
+        # reducao de ruido leve
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+
+        # binarizacao adaptativa: melhor que threshold fixo em documento
+        # com fundo irregular (papel amarelado, sombra de digitalizacao)
+        img = _binarizar_adaptativo(img)
+
+        destino = Path(tempfile.gettempdir()) / f"ocr_{caminho.stem}.png"
+        img.save(destino, "PNG")
+        return destino
+
+    except Exception as e:
+        log.warning("Falha no pre-processamento de %s: %s", caminho.name, e)
+        return caminho
+
+
+def _binarizar_adaptativo(img):
+    """Binarizacao adaptativa por media local.
+
+    Para cada pixel, compara com a media da vizinhanca. Se o pixel e
+    mais escuro que a media menos uma margem, vira preto. Senao, branco.
+    Funciona bem em documento com fundo irregular.
+    """
+    try:
+        from PIL import Image, ImageFilter
+    except ImportError:
+        return img
+
+    # media local com blur grande
+    media = img.filter(ImageFilter.BoxBlur(15))
+
+    # aplica: pixel < media - margem -> preto
+    pixels = img.load()
+    pixels_media = media.load()
+    largura, altura = img.size
+    margem = 12
+
+    for y in range(altura):
+        for x in range(largura):
+            if pixels[x, y] < pixels_media[x, y] - margem:
+                pixels[x, y] = 0
+            else:
+                pixels[x, y] = 255
+
+    return img
 
 
 # ---------------------------------------------------------------------------
@@ -148,99 +153,224 @@ def _preprocessar(img):
 # ---------------------------------------------------------------------------
 
 
-def _ocr_imagem(caminho: Path) -> str:
-    if not TESSERACT_OK:
-        log.warning("OCR ignorado (Tesseract indisponível): %s", caminho.name)
+def _rodar_tesseract(imagem: Path) -> str:
+    """Executa o Tesseract e devolve o texto."""
+    if not Path(TESSERACT_CMD).is_file():
+        log.error("Tesseract nao encontrado em %s", TESSERACT_CMD)
         return ""
 
-    img = cv2.imread(str(caminho))
-    if img is None:
-        log.warning("Não foi possível ler a imagem: %s", caminho.name)
-        return ""
+    cmd = [
+        TESSERACT_CMD,
+        str(imagem),
+        "stdout",
+        "-l",
+        TESSERACT_LANG,
+        "--psm",
+        "6",  # bloco uniforme de texto: melhor para documento fiscal
+        "--oem",
+        "3",  # LSTM + legacy, mais robusto
+        "-c",
+        "preserve_interword_spaces=1",
+    ]
 
-    th = _preprocessar(img)
+    # tessdata ao lado do executavel (Tesseract portatil)
+    if Path(TESSDATA_DIR).is_dir():
+        cmd += ["--tessdata-dir", TESSDATA_DIR]
+
     try:
-        return pytesseract.image_to_string(
-            th,
-            lang=TESSERACT_LANG,
-            config=_TESSERACT_CONFIG,
+        resultado = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            encoding="utf-8",
+            errors="replace",
         )
-    except Exception as e:
-        log.warning("OCR falhou em %s: %s", caminho.name, e)
-        return ""
-
-
-def _ocr_pdf(caminho: Path) -> str:
-    if not TESSERACT_OK:
-        log.warning("OCR ignorado (Tesseract indisponível): %s", caminho.name)
-        return ""
-
-    try:
-        paginas = convert_from_path(str(caminho), dpi=OCR_DPI)
-    except Exception as e:
-        log.warning("Falha ao converter PDF em imagens (%s): %s", caminho.name, e)
-        return ""
-
-    textos = []
-    for i, pg in enumerate(paginas, 1):
-        th = _preprocessar(pg)
-        try:
-            textos.append(
-                pytesseract.image_to_string(
-                    th,
-                    lang=TESSERACT_LANG,
-                    config=_TESSERACT_CONFIG,
-                )
+        if resultado.returncode != 0:
+            log.warning(
+                "Tesseract retornou %d: %s",
+                resultado.returncode,
+                resultado.stderr[:200],
             )
-        except Exception as e:
-            log.warning("OCR falhou na página %d de %s: %s", i, caminho.name, e)
-            textos.append("")
-
-    return "\n".join(textos)
-
-
-# ---------------------------------------------------------------------------
-# EXTRAÇÃO PRINCIPAL
-# ---------------------------------------------------------------------------
-
-
-def extrair_texto(caminho: Path) -> str:
-    """Retorna texto do documento. Usa cache por caminho+mtime."""
-    caminho = Path(caminho)
-
-    try:
-        chave = f"{caminho}:{caminho.stat().st_mtime}"
-    except OSError:
-        log.warning("Arquivo inacessível: %s", caminho)
+        return resultado.stdout or ""
+    except subprocess.TimeoutExpired:
+        log.error("Tesseract excedeu o tempo em %s", imagem.name)
+        return ""
+    except Exception as e:
+        log.error("Falha ao rodar Tesseract: %s", e)
         return ""
 
-    cache = _cache_texto.get(chave)
-    if cache is not None:
-        return cache
+
+# ---------------------------------------------------------------------------
+# PDF
+# ---------------------------------------------------------------------------
+
+
+def _texto_de_pdf(caminho: Path) -> str:
+    """Tenta extrair a camada de texto do PDF.
+
+    Se o PDF tem camada de texto (gerado por sistema), o texto e exato
+    e nao precisa de OCR. Se for escaneado, devolve vazio.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        log.warning("PyMuPDF nao instalado — PDF sempre passa por OCR")
+        return ""
+
+    try:
+        doc = fitz.open(caminho)
+        partes = []
+        for pagina in doc:
+            partes.append(pagina.get_text("text"))
+        doc.close()
+        texto = "\n".join(partes)
+        return texto if len(texto.strip()) >= OCR_MIN_CHARS_PDF else ""
+    except Exception as e:
+        log.warning("Falha ao ler PDF %s: %s", caminho.name, e)
+        return ""
+
+
+def _ocr_de_pdf(caminho: Path) -> str:
+    """Rasteriza o PDF e passa cada pagina pelo Tesseract."""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        log.error("PyMuPDF necessario para OCR de PDF escaneado")
+        return ""
+
+    try:
+        doc = fitz.open(caminho)
+        partes = []
+        for i, pagina in enumerate(doc):
+            # 300 DPI: padrao para documento fiscal
+            pix = pagina.get_pixmap(dpi=OCR_DPI)
+            tmp = Path(tempfile.gettempdir()) / f"pdf_{caminho.stem}_p{i}.png"
+            pix.save(tmp)
+
+            preparada = _preprocessar_imagem(tmp)
+            texto = _rodar_tesseract(preparada)
+            partes.append(texto)
+
+            for p in (tmp, preparada):
+                try:
+                    if p != caminho and p.exists():
+                        p.unlink()
+                except OSError:
+                    pass
+
+        doc.close()
+        return "\n".join(partes)
+    except Exception as e:
+        log.error("Falha no OCR de PDF %s: %s", caminho.name, e)
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# POS-PROCESSAMENTO DO TEXTO
+# ---------------------------------------------------------------------------
+
+# Correcoes que o Tesseract erra com frequencia em documento fiscal.
+# Aplicadas apenas em linhas que tem cara de CNPJ ou valor.
+RE_LINHA_CNPJ = re.compile(r"(?:cnpj|cpf|contribuinte|pagador)", re.IGNORECASE)
+RE_LINHA_VALOR = re.compile(r"(?:valor|total|r\$)", re.IGNORECASE)
+
+MAPA_OCR_DIGITOS = str.maketrans(
+    {
+        "O": "0",
+        "o": "0",
+        "I": "1",
+        "l": "1",
+        "|": "1",
+        "S": "5",
+        "B": "8",
+        "Z": "2",
+        "G": "6",
+    }
+)
+
+
+def _corrigir_linha_cnpj(linha: str) -> str:
+    """Corrige caracteres confundidos em linha que contem CNPJ."""
+
+    # so corrige o trecho que tem cara de CNPJ (14 digitos com pontuacao)
+    def _sub(m):
+        return m.group(0).translate(MAPA_OCR_DIGITOS)
+
+    return re.sub(r"[\dOoIl|SBZG][\dOoIl|SBZG.\-/]{12,20}", _sub, linha)
+
+
+def _pos_processar(texto: str) -> str:
+    """Limpa e corrige o texto do OCR."""
+    if not texto:
+        return ""
+
+    # remove caracteres de controle
+    texto = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", texto)
+
+    linhas = []
+    for linha in texto.splitlines():
+        # corrige CNPJ so em linhas com contexto de CNPJ
+        if RE_LINHA_CNPJ.search(linha):
+            linha = _corrigir_linha_cnpj(linha)
+
+        # normaliza espacos multiplos
+        linha = re.sub(r"[ \t]+", " ", linha).strip()
+        linhas.append(linha)
+
+    texto = "\n".join(linhas)
+
+    # remove linhas vazias consecutivas
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+
+    return texto.strip()
+
+
+# ---------------------------------------------------------------------------
+# API PUBLICA
+# ---------------------------------------------------------------------------
+
+
+def extrair_texto(caminho: Path | str) -> str:
+    """Extrai o texto de um PDF ou imagem.
+
+    Ordem:
+    1. Cache por hash do arquivo
+    2. PDF: tenta camada de texto; se falhar, OCR
+    3. Imagem: pre-processa e roda OCR
+    """
+    caminho = Path(caminho)
+    if not caminho.is_file():
+        log.error("Arquivo nao encontrado: %s", caminho)
+        return ""
+
+    chave = _hash_arquivo(caminho)
+    em_cache = _cache_get(chave)
+    if em_cache is not None:
+        log.debug("Cache hit: %s", caminho.name)
+        return em_cache
 
     ext = caminho.suffix.lower()
-    texto = ""
 
     if ext == ".pdf":
+        texto = _texto_de_pdf(caminho)
+        if not texto:
+            log.info("PDF sem camada de texto, usando OCR: %s", caminho.name)
+            texto = _ocr_de_pdf(caminho)
+    elif ext in EXT_IMAGEM:
+        preparada = _preprocessar_imagem(caminho)
+        texto = _rodar_tesseract(preparada)
         try:
-            with pdfplumber.open(caminho) as pdf:
-                texto = "\n".join((p.extract_text() or "") for p in pdf.pages)
-        except Exception as e:
-            log.warning("pdfplumber falhou em %s: %s", caminho.name, e)
-
-        if len(texto.strip()) < OCR_MIN_CHARS_PDF:
-            log.info("PDF escaneado detectado, aplicando OCR: %s", caminho.name)
-            texto = _ocr_pdf(caminho)
-
-    elif ext in (".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"):
-        texto = _ocr_imagem(caminho)
-
+            if preparada != caminho and preparada.exists():
+                preparada.unlink()
+        except OSError:
+            pass
     else:
-        texto = ""
+        log.warning("Extensao nao suportada para OCR: %s", ext)
+        return ""
 
-    _cache_texto.put(chave, texto)
+    texto = _pos_processar(texto)
+    _cache_set(chave, texto)
+
+    log.info("OCR concluido: %s (%d chars)", caminho.name, len(texto))
     return texto
-
-
-def hash_do_documento(texto: str) -> str:
-    return hash_layout(texto)

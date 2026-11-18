@@ -8,6 +8,7 @@ Regras de negócio:
 - Cliente paga menos -> PARCIAL com saldo pendente.
 - Cliente paga mais -> DIVERGENTE para revisão manual.
 - Score por critério: valor, cnpj, cliente, nf, data (pesos do config).
+- CNPJ divergente tem prioridade absoluta sobre qualquer outro status.
 """
 
 from itertools import combinations
@@ -35,6 +36,49 @@ def _soma(valores: list[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# COMPARACAO DE CNPJ
+# ---------------------------------------------------------------------------
+
+
+def comparar_cnpjs(guia: dict, comp_cliente: dict | None) -> dict:
+    """Compara o CNPJ da guia com o do comprovante do cliente.
+
+    Ambos passam por normalizar_cnpj antes da comparacao, para evitar
+    falso negativo quando um vem formatado e o outro nao.
+
+    Retorna cnpj_divergente = True (diferentes), False (iguais)
+    ou None (um dos dois nao foi lido).
+    """
+    cnpj_guia = normalizar_cnpj(guia.get("cnpj") or "")
+    cnpj_comprovante = normalizar_cnpj((comp_cliente or {}).get("cnpj_pagador") or "")
+
+    if not cnpj_guia or not cnpj_comprovante:
+        return {
+            "cnpj_guia": cnpj_guia,
+            "cnpj_comprovante": cnpj_comprovante,
+            "cnpj_divergente": None,
+            "motivo_cnpj": "CNPJ nao extraido em um dos documentos",
+        }
+
+    if cnpj_guia == cnpj_comprovante:
+        return {
+            "cnpj_guia": cnpj_guia,
+            "cnpj_comprovante": cnpj_comprovante,
+            "cnpj_divergente": False,
+            "motivo_cnpj": "CNPJ confere",
+        }
+
+    return {
+        "cnpj_guia": cnpj_guia,
+        "cnpj_comprovante": cnpj_comprovante,
+        "cnpj_divergente": True,
+        "motivo_cnpj": (
+            f"CNPJ divergente: guia {cnpj_guia} x comprovante {cnpj_comprovante}"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # SCORE POR CRITÉRIO
 # ---------------------------------------------------------------------------
 
@@ -57,7 +101,7 @@ def calcular_score(
         elif vc is not None:
             detalhe["valor"] = int(SCORE_PESOS["valor"] * 0.6)
 
-    # CNPJ: guia == CNPJ do comprovante do cliente
+    # CNPJ: guia == CNPJ do comprovante do cliente (ambos normalizados)
     cg = normalizar_cnpj(guia.get("cnpj") or "")
     cc = normalizar_cnpj((comp_cliente or {}).get("cnpj_pagador") or "")
     if cg and cc and cg == cc:
@@ -116,6 +160,7 @@ def conciliar_pagamento_jadlog(guia: dict, comprovante: dict) -> dict:
             "diferenca": dif,
             "motivo": f"Jadlog pagou R$ {abs(dif):.2f} a menos que a guia",
         }
+
     return {
         "status": Status.DIV_VALOR,
         "score": 30,
@@ -159,7 +204,6 @@ def _combinacoes_validas(
 
     # dp[soma] = tupla de índices da PRIMEIRA combinação que atinge essa soma
     dp: dict[int, tuple[int, ...]] = {0: ()}
-
     for idx, valor in itens:
         for soma, combo in list(dp.items()):
             nova = soma + valor
@@ -220,6 +264,7 @@ def conciliar_reembolso_cliente(pendentes: list[dict], comprovante: dict) -> dic
     interpretação possível. Qualquer ambiguidade vai para revisão manual.
     """
     valor = comprovante.get("valor_reembolso")
+
     if valor is None:
         return {
             "status": Status.REVISAO,
@@ -288,6 +333,7 @@ def conciliar_reembolso_cliente(pendentes: list[dict], comprovante: dict) -> dic
             valor,
             "Match direto: um reembolso com valor idêntico",
         )
+
     return _resultado(
         Status.CONFERIDO,
         CAMADA_UNICA,
@@ -323,7 +369,11 @@ def conciliar_remessa(
     comp_cliente: dict | None,
     pendentes_cliente: list[dict] | None = None,
 ) -> dict:
-    """Executa as duas pontas e devolve o resultado consolidado."""
+    """Executa as duas pontas e devolve o resultado consolidado.
+
+    A divergencia de CNPJ tem prioridade absoluta: e um erro de
+    identificacao do pagador, mais grave que diferenca de valor.
+    """
     resultado = {
         "numero_remessa": guia.get("numero_remessa"),
         "numero_nf": guia.get("numero_nf"),
@@ -334,7 +384,15 @@ def conciliar_remessa(
         "detalhe_score": {},
     }
 
+    # ------------------------------------------------------------------
+    # Comparacao de CNPJ (guia x comprovante do cliente)
+    # ------------------------------------------------------------------
+    comparacao = comparar_cnpjs(guia, comp_cliente)
+    resultado.update(comparacao)
+
+    # ------------------------------------------------------------------
     # Ponta Jadlog
+    # ------------------------------------------------------------------
     if comp_jadlog:
         resultado["lado_jadlog"] = conciliar_pagamento_jadlog(guia, comp_jadlog)
     else:
@@ -345,7 +403,9 @@ def conciliar_remessa(
             "motivo": "Comprovante da Jadlog não localizado",
         }
 
+    # ------------------------------------------------------------------
     # Ponta cliente
+    # ------------------------------------------------------------------
     if comp_cliente:
         resultado["lado_cliente"] = conciliar_reembolso_cliente(
             pendentes_cliente or [], comp_cliente
@@ -360,14 +420,29 @@ def conciliar_remessa(
             "motivo": "Comprovante do cliente não localizado",
         }
 
+    # ------------------------------------------------------------------
     # Score por critério (pesos do config)
+    # ------------------------------------------------------------------
     score, detalhe = calcular_score(guia, comp_jadlog, comp_cliente)
     resultado["score_final"] = score
     resultado["detalhe_score"] = detalhe
 
-    # Status final: divergência específica tem prioridade
+    # ------------------------------------------------------------------
+    # Status final
+    # CNPJ divergente tem prioridade sobre qualquer outro status.
+    # ------------------------------------------------------------------
+    if comparacao["cnpj_divergente"] is True:
+        resultado["status_final"] = Status.DIV_CNPJ
+        resultado["score_final"] = 0
+        resultado["motivo_final"] = comparacao["motivo_cnpj"]
+        log.warning(
+            "Remessa %s: %s",
+            resultado.get("numero_remessa"),
+            comparacao["motivo_cnpj"],
+        )
+        return resultado
+
     prioridade = [
-        Status.DIV_CNPJ,
         Status.DIV_NF,
         Status.DIV_VALOR,
         Status.DIV_DATA,
@@ -386,11 +461,20 @@ def conciliar_remessa(
             resultado["status_final"] = st
             break
 
-    # Refina divergência de valor para CNPJ/NF quando aplicável
+    # Refina divergência de valor para NF quando aplicável
     if resultado["status_final"] == Status.DIV_VALOR:
-        if detalhe["cnpj"] == 0 and guia.get("cnpj"):
-            resultado["status_final"] = Status.DIV_CNPJ
-        elif detalhe["nf"] == 0 and guia.get("numero_nf"):
+        if detalhe["nf"] == 0 and guia.get("numero_nf"):
             resultado["status_final"] = Status.DIV_NF
+
+    # ------------------------------------------------------------------
+    # CNPJ nao lido: nao da para confirmar nem negar.
+    # Se o motor chegou a CONFERIDO, rebaixa para revisao manual.
+    # ------------------------------------------------------------------
+    if (
+        comparacao["cnpj_divergente"] is None
+        and resultado["status_final"] == Status.CONFERIDO
+    ):
+        resultado["status_final"] = Status.REVISAO
+        resultado["motivo_final"] = comparacao["motivo_cnpj"]
 
     return resultado
