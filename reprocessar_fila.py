@@ -1,277 +1,300 @@
-"""Reprocessa os itens da fila de treinamento com o OCR novo.
+"""Reprocessa a fila de treinamento.
 
-Para cada entrada nao resolvida da fila_treinamento:
-1. Limpa o cache em memoria do OCR (o texto antigo esta la)
-2. Reextrai o texto do arquivo com o ocr_engine novo
-3. Reextrai os campos com o pdf_reader novo
-4. Compara com o que estava na fila
-5. Mostra o antes/depois
+Roda o OCR e a extracao em todos os itens pendentes da fila e, opcionalmente,
+grava os campos extraidos no banco.
 
-NAO altera o banco por padrao. Use --aplicar para gravar os resultados.
+Dois modos:
+- Dry-run (padrao): mostra o resultado sem gravar nada.
+- Aplicar: grava os campos e marca os itens como resolvidos.
 
-Uso:
-    python reprocessar_fila.py              # dry-run: so mostra
-    python reprocessar_fila.py --aplicar    # grava os resultados
-    python reprocessar_fila.py --remessa 18131502322673
+Uso pela linha de comando:
+    python reprocessar_fila.py              # dry-run
+    python reprocessar_fila.py --aplicar    # grava
+    python reprocessar_fila.py --limite 8   # so os 8 primeiros
+
+Uso pelo app Streamlit:
+    from reprocessar_fila import reprocessar
+    ret = reprocessar(limite=None, aplicar=False)
 """
 
 import argparse
 import json
-import sys
+import sqlite3
 from pathlib import Path
 
-import database as db
 import ocr_engine
-import pdf_reader
-from config import TipoDoc
+from config import DB_PATH, TipoDoc
 from log_manager import get_logger
+from pdf_reader import extrair_por_tipo
 
 log = get_logger("reprocessar_fila")
 
-# Campos que o pdf_reader precisa extrair para o item sair da fila
+# Campos que precisam existir para o item ser considerado resolvido,
+# por tipo de documento.
 CAMPOS_OBRIGATORIOS = {
     TipoDoc.COMP_CLIENTE: ["valor_reembolso", "data_reembolso"],
     TipoDoc.COMP_JADLOG: ["valor_pago_jadlog", "data_pagamento_jadlog"],
-    TipoDoc.GUIA: ["valor_guia", "data_vencimento"],
+    TipoDoc.GUIA: ["valor_guia", "data_emissao", "data_vencimento"],
 }
 
 
-def _carregar_fila(remessa: str | None = None) -> list[dict]:
-    """Carrega as entradas nao resolvidas da fila."""
-    sql = "SELECT * FROM fila_treinamento WHERE resolvido = 0"
-    params = []
-    if remessa:
-        sql += " AND numero_remessa = ?"
-        params.append(remessa)
-    sql += " ORDER BY id DESC"
-
-    with db.cursor() as cur:
-        cur.execute(sql, params)
-        return [dict(r) for r in cur.fetchall()]
+# ---------------------------------------------------------------------------
+# BANCO
+# ---------------------------------------------------------------------------
 
 
-def _campos_faltantes(campos: dict, tipo: str) -> list[str]:
-    """Lista os campos obrigatorios que nao foram extraidos."""
+def _conectar() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _listar_pendentes(limite: int | None = None) -> list[dict]:
+    """Itens da fila ainda nao resolvidos, ordenados por id decrescente."""
+    sql = (
+        "SELECT id, tipo_documento, numero_remessa, caminho_arquivo, "
+        "campos_json, confianca FROM fila_treinamento "
+        "WHERE resolvido = 0 ORDER BY id DESC"
+    )
+    if limite:
+        sql += f" LIMIT {int(limite)}"
+
+    con = _conectar()
+    try:
+        return [dict(r) for r in con.execute(sql).fetchall()]
+    finally:
+        con.close()
+
+
+def _gravar_item(item_id: int, campos: dict, confianca: int) -> None:
+    """Grava os campos extraidos e marca o item como resolvido."""
+    con = _conectar()
+    try:
+        con.execute(
+            "UPDATE fila_treinamento "
+            "SET campos_json = ?, confianca = ?, resolvido = 1 "
+            "WHERE id = ?",
+            (json.dumps(campos, ensure_ascii=False), confianca, item_id),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------------------
+# EXTRACAO
+# ---------------------------------------------------------------------------
+
+
+def _campos_do_item(item: dict) -> dict:
+    """Le o campos_json do item e devolve o dicionario de campos."""
+    try:
+        dados = json.loads(item.get("campos_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return dados.get("campos", dados) or {}
+
+
+def _faltando(campos: dict, tipo: str) -> list[str]:
+    """Campos obrigatorios que estao vazios para o tipo do documento."""
     obrigatorios = CAMPOS_OBRIGATORIOS.get(tipo, [])
     return [c for c in obrigatorios if not campos.get(c)]
 
 
-def _limpar_cache_ocr():
-    """Limpa o cache em memoria do OCR.
+def _extrair(item: dict) -> tuple[dict, list[str], int]:
+    """Roda o OCR e a extracao em um item da fila.
 
-    Sem isso, o reprocessamento devolve o texto antigo (ruim) do cache,
-    porque a chave e o hash do arquivo, que nao mudou.
+    Retorna (campos_extraidos, campos_faltando, confianca).
+    """
+    caminho = Path(item["caminho_arquivo"])
+    tipo = item["tipo_documento"]
+
+    if not caminho.is_file():
+        log.warning("Arquivo nao encontrado: %s", caminho)
+        return {}, _faltando({}, tipo), 0
+
+    try:
+        resultado = extrair_por_tipo(caminho, tipo)
+    except Exception as e:
+        log.error("Falha ao extrair %s: %s", caminho.name, e)
+        return {}, _faltando({}, tipo), 0
+
+    # Remove as chaves internas que nao vao para o banco
+    campos = {
+        k: v
+        for k, v in resultado.items()
+        if k not in ("texto", "_rotulos", "tipo", "confianca")
+    }
+    confianca = int(resultado.get("confianca") or 0)
+    faltando = _faltando(campos, tipo)
+
+    return campos, faltando, confianca
+
+
+# ---------------------------------------------------------------------------
+# API PUBLICA
+# ---------------------------------------------------------------------------
+
+
+def reprocessar(limite: int | None = None, aplicar: bool = False) -> dict:
+    """Reprocessa a fila de treinamento.
+
+    Args:
+        limite: numero maximo de itens a processar. None = todos.
+        aplicar: se True, grava os campos no banco e marca como resolvidos.
+                 Se False (padrao), apenas simula (dry-run).
+
+    Retorna:
+        {
+            "total": int,
+            "resolvidos": int,
+            "falhando": int,
+            "erros": int,
+            "aplicado": bool,
+            "detalhes": list[dict],
+        }
+
+    Cada item de `detalhes` tem:
+        id, arquivo, tipo, antes, depois, faltando, confianca, status
     """
     ocr_engine._CACHE.clear()
     log.info("Cache do OCR limpo")
 
+    pendentes = _listar_pendentes(limite)
+    total = len(pendentes)
 
-def _reprocessar_entrada(entrada: dict) -> dict:
-    """Reprocessa uma entrada da fila.
+    resolvidos = 0
+    falhando = 0
+    erros = 0
+    detalhes: list[dict] = []
 
-    Retorna dict com o antes/depois.
-    """
-    arquivo = Path(entrada["caminho_arquivo"])
-    tipo = entrada["tipo_documento"]
+    for i, item in enumerate(pendentes, start=1):
+        nome = Path(item["caminho_arquivo"]).name
+        tipo = item["tipo_documento"]
+        antes = _campos_do_item(item)
 
-    resultado = {
-        "id": entrada["id"],
-        "remessa": entrada.get("numero_remessa"),
-        "arquivo": arquivo.name,
-        "tipo": tipo,
-        "ok": False,
-        "motivo": "",
-        "antes": {},
-        "depois": {},
-    }
+        log.info("[%d/%d] ID %s | %s", i, total, item["id"], nome)
 
-    if not arquivo.is_file():
-        resultado["motivo"] = "Arquivo nao encontrado"
-        return resultado
+        try:
+            campos, faltando, confianca = _extrair(item)
+        except Exception as e:
+            log.error("Erro no item %s: %s", item["id"], e)
+            erros += 1
+            detalhes.append(
+                {
+                    "id": item["id"],
+                    "arquivo": nome,
+                    "tipo": tipo,
+                    "antes": antes,
+                    "depois": {},
+                    "faltando": [],
+                    "confianca": 0,
+                    "status": "ERRO",
+                }
+            )
+            continue
 
-    # Campos que estavam na fila (o que falhou antes)
-    try:
-        campos_antes = json.loads(entrada.get("campos_json") or "{}")
-    except (json.JSONDecodeError, TypeError):
-        campos_antes = {}
+        if faltando:
+            falhando += 1
+            status = "FALHANDO"
+        else:
+            resolvidos += 1
+            status = "RESOLVIDO"
 
-    resultado["antes"] = {
-        "valor": campos_antes.get("valor_reembolso")
-        or campos_antes.get("valor_pago_jadlog")
-        or campos_antes.get("valor_guia"),
-        "data": campos_antes.get("data_reembolso")
-        or campos_antes.get("data_pagamento_jadlog")
-        or campos_antes.get("data_vencimento"),
-        "faltantes": _campos_faltantes(campos_antes, tipo),
-    }
-
-    # Reextrai com o OCR novo
-    try:
-        campos_novos = pdf_reader.extrair_por_tipo(arquivo, tipo)
-    except Exception as e:
-        resultado["motivo"] = f"Erro na extracao: {e}"
-        return resultado
-
-    resultado["depois"] = {
-        "valor": campos_novos.get("valor_reembolso")
-        or campos_novos.get("valor_pago_jadlog")
-        or campos_novos.get("valor_guia"),
-        "data": campos_novos.get("data_reembolso")
-        or campos_novos.get("data_pagamento_jadlog")
-        or campos_novos.get("data_vencimento"),
-        "faltantes": _campos_faltantes(campos_novos, tipo),
-        "confianca": campos_novos.get("confianca"),
-        "rotulos": campos_novos.get("_rotulos", {}),
-    }
-
-    resultado["ok"] = True
-    return resultado
-
-
-def _aplicar_resultado(resultado: dict, campos_novos: dict):
-    """Atualiza a fila com o resultado do reprocessamento.
-
-    Se o item agora tem todos os campos, marca como resolvido.
-    Senao, atualiza o campos_json com o que foi extraido.
-    """
-    faltantes = resultado["depois"]["faltantes"]
-    resolvido = 0 if faltantes else 1
-
-    with db.cursor() as cur:
-        cur.execute(
-            """UPDATE fila_treinamento
-               SET campos_json = ?, confianca = ?, resolvido = ?
-               WHERE id = ?""",
-            (
-                json.dumps(campos_novos, default=str),
-                campos_novos.get("confianca", 0),
-                resolvido,
-                resultado["id"],
-            ),
+        detalhes.append(
+            {
+                "id": item["id"],
+                "arquivo": nome,
+                "tipo": tipo,
+                "antes": antes,
+                "depois": campos,
+                "faltando": faltando,
+                "confianca": confianca,
+                "status": status,
+            }
         )
 
-    return resolvido
+        if aplicar and status == "RESOLVIDO":
+            try:
+                _gravar_item(item["id"], campos, confianca)
+            except Exception as e:
+                log.error("Falha ao gravar item %s: %s", item["id"], e)
+                erros += 1
 
-
-def _formatar_valor(v) -> str:
-    if v is None:
-        return "-"
-    if isinstance(v, float):
-        return f"R$ {v:.2f}"
-    return str(v)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Reprocessa os itens da fila de treinamento"
+    log.info(
+        "Reprocessamento: %d processados, %d resolvidos, %d falhando, %d erros",
+        total,
+        resolvidos,
+        falhando,
+        erros,
     )
+
+    return {
+        "total": total,
+        "resolvidos": resolvidos,
+        "falhando": falhando,
+        "erros": erros,
+        "aplicado": aplicar,
+        "detalhes": detalhes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _imprimir_detalhes(ret: dict) -> None:
+    """Imprime o resultado no formato do script de linha de comando."""
+    for d in ret["detalhes"]:
+        print(f"[{d['id']}] {d['arquivo']} ({d['tipo']})")
+        if d["status"] == "ERRO":
+            print("  >>> ERRO ao processar")
+            continue
+        faltando = d["faltando"]
+        if faltando:
+            print(f"  >>> AINDA FALHANDO: {faltando}")
+        else:
+            print("  >>> RESOLVIDO: todos os campos extraidos")
+        print(f"  conf={d['confianca']}%")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Reprocessa a fila de treinamento.")
     parser.add_argument(
         "--aplicar",
         action="store_true",
-        help="Grava os resultados no banco (padrao: dry-run)",
-    )
-    parser.add_argument(
-        "--remessa",
-        type=str,
-        default=None,
-        help="Filtra por numero de remessa",
+        help="Grava os campos no banco (padrao: dry-run).",
     )
     parser.add_argument(
         "--limite",
         type=int,
         default=None,
-        help="Processa no maximo N entradas",
+        help="Numero maximo de itens a processar.",
     )
     args = parser.parse_args()
 
-    db.init_db()
-
-    entradas = _carregar_fila(args.remessa)
-    if not entradas:
-        print("\n  Fila vazia. Nada a reprocessar.\n")
-        return 0
-
-    if args.limite:
-        entradas = entradas[: args.limite]
-
     modo = "APLICAR" if args.aplicar else "DRY-RUN (nada sera gravado)"
-    print(f"\n{'=' * 70}")
+    print("=" * 70)
     print(f"  REPROCESSAMENTO DA FILA — {modo}")
-    print(f"{'=' * 70}")
-    print(f"\n  Entradas a processar: {len(entradas)}\n")
+    print("=" * 70)
 
-    _limpar_cache_ocr()
-
-    resolvidos = 0
-    ainda_falhando = 0
-    erros = 0
-
-    for i, entrada in enumerate(entradas, 1):
-        print(
-            f"[{i}/{len(entradas)}] ID {entrada['id']} | {entrada.get('numero_remessa')}"
-        )
-        print(f"  Arquivo: {Path(entrada['caminho_arquivo']).name}")
-
-        resultado = _reprocessar_entrada(entrada)
-
-        if not resultado["ok"]:
-            print(f"  ERRO: {resultado['motivo']}\n")
-            erros += 1
-            continue
-
-        antes = resultado["antes"]
-        depois = resultado["depois"]
-
-        print(
-            f"  ANTES:  valor={_formatar_valor(antes['valor'])} "
-            f"data={antes['data'] or '-'} "
-            f"faltando={antes['faltantes']}"
-        )
-        print(
-            f"  DEPOIS: valor={_formatar_valor(depois['valor'])} "
-            f"data={depois['data'] or '-'} "
-            f"faltando={depois['faltantes']} "
-            f"conf={depois['confianca']}%"
-        )
-
-        if depois["rotulos"]:
-            print(f"  Rotulos: {depois['rotulos']}")
-
-        if not depois["faltantes"]:
-            print("  >>> RESOLVIDO: todos os campos extraidos")
-            resolvidos += 1
-        else:
-            print(f"  >>> AINDA FALHANDO: {depois['faltantes']}")
-            ainda_falhando += 1
-
-        if args.aplicar:
-            try:
-                campos_novos = pdf_reader.extrair_por_tipo(
-                    Path(entrada["caminho_arquivo"]), entrada["tipo_documento"]
-                )
-                _aplicar_resultado(resultado, campos_novos)
-                print("  (gravado no banco)")
-            except Exception as e:
-                print(f"  ERRO ao gravar: {e}")
-                erros += 1
-
-        print()
+    ret = reprocessar(limite=args.limite, aplicar=args.aplicar)
+    _imprimir_detalhes(ret)
 
     print("=" * 70)
-    print(f"  RESULTADO")
+    print("  RESULTADO")
     print("=" * 70)
-    print(f"  Total processado:   {len(entradas)}")
-    print(f"  Resolvidos:         {resolvidos}")
-    print(f"  Ainda falhando:     {ainda_falhando}")
-    print(f"  Erros:              {erros}")
-
+    print(f"  Total processado:   {ret['total']}")
+    print(f"  Resolvidos:         {ret['resolvidos']}")
+    print(f"  Ainda falhando:     {ret['falhando']}")
+    print(f"  Erros:              {ret['erros']}")
     if not args.aplicar:
-        print(f"\n  Modo DRY-RUN: nada foi gravado.")
-        print(f"  Para aplicar: python reprocessar_fila.py --aplicar")
-
-    print()
-    return 0
+        print("  Modo DRY-RUN: nada foi gravado.")
+        print("  Para aplicar: python reprocessar_fila.py --aplicar")
+    else:
+        print("  Campos gravados no banco.")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
