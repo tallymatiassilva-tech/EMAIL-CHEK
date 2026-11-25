@@ -6,9 +6,14 @@ env/
 # Dados e documentos
 data/
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 *.log
+
+# Controle de processamento
+.ultimo_processamento
 
 # Arquivos sensíveis
 .env
@@ -36,22 +41,6 @@ desktop.ini
 # Backups
 backup/
 *.bak
-# Planilhas de teste com dados
-*.xlsx
-*.xls
-*.csv
-
-# Scripts de debug e teste
-debug*.py
-teste*.py
-ver_fila.py
-ver_layouts.py
-ver_fila_treinamento.py
-ver_revisao_manual.py
-ver_tabelas.py
-limpar_cache*.py
-planilha_*.xlsx
-teste_simples.png
 
 # Planilhas e imagens de teste
 *.xlsx
@@ -59,7 +48,7 @@ teste_simples.png
 *.csv
 teste_simples.png
 
-# Scripts de diagnostico e teste
+# Scripts de debug e teste
 debug*.py
 teste*.py
 ver_fila.py
