@@ -12,9 +12,31 @@ Fluxo por remessa:
 9. Busca pendentes do cliente por CNPJ
 10. Concilia com o motor
 11. Persiste o resultado
+
+Processamento seletivo:
+- processar_pasta_raiz(pasta)                    -> todas as subpastas
+- processar_pasta_raiz(pasta, remessas=[...])    -> apenas as remessas listadas
+- processar_pasta_raiz(pasta, apenas_novas=True) -> apenas pastas com arquivo
+                                                    modificado depois do último
+                                                    processamento registrado
+
+Controle de "arquivo novo":
+O filtro usa o arquivo .ultimo_processamento na pasta raiz, que guarda em
+JSON o timestamp da última execução e o resumo do que foi processado.
+Isso é independente do campo data_atualizacao do banco, que o persistence.py
+só atualiza quando status ou score mudam. Assim, uma remessa reprocessada
+com resultado idêntico não volta a entrar como "nova" na execução seguinte.
+
+Formato do arquivo de controle:
+    {"timestamp": 1764086400.123, "total": 42, "processadas": 40,
+     "falhas": 2, "quando": "2026-11-25T16:00:00"}
+
+Compatibilidade: se o arquivo contiver apenas um número (formato antigo),
+ele é lido como timestamp e os demais campos ficam vazios.
 """
 
 import json
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -65,6 +87,10 @@ LIMITE_BYTES_IMAGEM_EMBUTIDA = 50_000
 # o cache com um mapa ruim.
 CONFIANCA_MINIMA_LAYOUT = 60.0
 
+# Nome do arquivo de controle que guarda o timestamp e o resumo do
+# último processamento. Fica na pasta raiz, fora das subpastas de remessa.
+ARQUIVO_CONTROLE = ".ultimo_processamento"
+
 # Campos obrigatórios por tipo de documento. Se algum faltar, o documento
 # vai para a fila de treinamento para você criar um layout específico.
 CAMPOS_OBRIGATORIOS = {
@@ -77,8 +103,6 @@ CAMPOS_OBRIGATORIOS = {
 # ---------------------------------------------------------------------------
 # COLETA DOS ARQUIVOS
 # ---------------------------------------------------------------------------
-
-
 def _listar_arquivos(pasta: Path) -> list[Path]:
     """Lista arquivos suportados na pasta da remessa."""
     return sorted(
@@ -143,8 +167,6 @@ def _calcular_dias_reembolso(
 # ---------------------------------------------------------------------------
 # APRENDIZADO DE LAYOUT
 # ---------------------------------------------------------------------------
-
-
 def _rotulos_do_campo(campos: dict) -> dict:
     """Extrai o mapa campo -> rótulo que o extrator devolveu.
 
@@ -214,7 +236,6 @@ def _aprender_layout(
 # FILA DE TREINAMENTO (Etapa 4)
 # ---------------------------------------------------------------------------
 
-
 def _campos_faltantes(tipo: str, campos: dict) -> list[str]:
     """Lista os campos obrigatórios que vieram vazios na extração."""
     obrigatorios = CAMPOS_OBRIGATORIOS.get(tipo, [])
@@ -277,8 +298,6 @@ def _registrar_falha(
 # ---------------------------------------------------------------------------
 # PROCESSAMENTO DE UMA REMESSA
 # ---------------------------------------------------------------------------
-
-
 def processar_remessa(pasta: Path, remessa: str) -> dict:
     """Processa todos os arquivos de uma pasta de remessa."""
     # Garante que as tabelas existam (idempotente)
@@ -426,7 +445,6 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
     # divergência de identificação precisa de revisão humana antes disso.
     cnpj_divergente = bool(resultado.get("cnpj_divergente"))
     tem_quitacao_agrupada = bool((resultado.get("lado_cliente") or {}).get("quitados"))
-
     if tem_quitacao_agrupada and not cnpj_divergente:
         ps.salvar_quitacao_agrupada(resultado)
     else:
@@ -450,12 +468,186 @@ def processar_remessa(pasta: Path, remessa: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# SELEÇÃO DE REMESSAS
+# ---------------------------------------------------------------------------
+def _mtime_mais_recente(pasta: Path) -> float:
+    """Maior mtime entre os arquivos suportados da pasta. 0 se não houver."""
+    maior = 0.0
+    try:
+        for arq in pasta.iterdir():
+            if arq.is_file() and arq.suffix.lower() in EXT_SUPORTADAS:
+                try:
+                    m = arq.stat().st_mtime
+                    if m > maior:
+                        maior = m
+                except OSError:
+                    continue
+    except OSError:
+        return 0.0
+    return maior
+
+
+def _ler_controle(pasta_raiz: Path) -> dict:
+    """Lê o arquivo de controle e devolve um dict normalizado.
+
+    Sempre retorna as chaves timestamp, total, processadas, falhas e quando.
+    Aceita o formato antigo (apenas um número) por compatibilidade.
+    """
+    vazio = {
+        "timestamp": 0.0,
+        "total": 0,
+        "processadas": 0,
+        "falhas": 0,
+        "quando": None,
+    }
+    caminho = pasta_raiz / ARQUIVO_CONTROLE
+    try:
+        bruto = caminho.read_text().strip()
+    except OSError:
+        return vazio
+
+    if not bruto:
+        return vazio
+
+    # Formato antigo: apenas o timestamp como número
+    try:
+        return {**vazio, "timestamp": float(bruto)}
+    except ValueError:
+        pass
+
+    # Formato novo: JSON com o resumo
+    try:
+        dados = json.loads(bruto)
+    except (json.JSONDecodeError, TypeError):
+        log.warning("Arquivo de controle ilegível: %s", caminho)
+        return vazio
+
+    if not isinstance(dados, dict):
+        return vazio
+
+    return {
+        "timestamp": float(dados.get("timestamp") or 0.0),
+        "total": int(dados.get("total") or 0),
+        "processadas": int(dados.get("processadas") or 0),
+        "falhas": int(dados.get("falhas") or 0),
+        "quando": dados.get("quando"),
+    }
+
+
+def _gravar_controle(
+    pasta_raiz: Path,
+    total: int = 0,
+    processadas: int = 0,
+    falhas: int = 0,
+    quando: float | None = None,
+) -> None:
+    """Grava o timestamp e o resumo do processamento no arquivo de controle."""
+    ts = quando or time.time()
+    dados = {
+        "timestamp": ts,
+        "total": int(total),
+        "processadas": int(processadas),
+        "falhas": int(falhas),
+        "quando": datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
+    }
+    try:
+        (pasta_raiz / ARQUIVO_CONTROLE).write_text(
+            json.dumps(dados, ensure_ascii=False, indent=2)
+        )
+    except OSError as e:
+        log.warning("Não foi possível gravar %s: %s", ARQUIVO_CONTROLE, e)
+
+
+def _remessas_com_arquivo_novo(pasta_raiz: Path) -> list[str]:
+    """Remessas cuja pasta tem arquivo mais novo que o último processamento.
+
+    Usa o arquivo de controle .ultimo_processamento em vez da
+    data_atualizacao do banco. O persistence.py só atualiza essa data
+    quando o status ou o score mudam, então uma remessa reprocessada com
+    resultado idêntico ficaria com data antiga e voltaria a entrar como
+    "nova" toda vez. O controle local registra o instante real da execução.
+    """
+    ultimo = _ler_controle(pasta_raiz)["timestamp"]
+    novas = []
+    for sub in sorted(p for p in pasta_raiz.iterdir() if p.is_dir()):
+        mtime = _mtime_mais_recente(sub)
+        if mtime == 0:
+            continue
+        if mtime > ultimo:
+            novas.append(sub.name)
+    return novas
+
+
+def _selecionar_subpastas(
+    pasta_raiz: Path,
+    remessas: list[str] | None = None,
+    apenas_novas: bool = False,
+) -> tuple[list[Path], list[str]]:
+    """Resolve quais subpastas processar.
+
+    Retorna (subpastas, ignoradas).
+    - remessas: lista explícita de números de remessa. Vence sobre apenas_novas.
+    - apenas_novas: processa só pastas com arquivo mais novo que o controle.
+    - nenhum dos dois: processa todas.
+    """
+    todas = sorted(p for p in pasta_raiz.iterdir() if p.is_dir())
+
+    if remessas:
+        alvo = {str(r).strip() for r in remessas if str(r).strip()}
+        selecionadas = [p for p in todas if p.name in alvo]
+        encontradas = {p.name for p in selecionadas}
+        faltando = sorted(alvo - encontradas)
+        if faltando:
+            log.warning("Remessas sem pasta em %s: %s", pasta_raiz, ", ".join(faltando))
+        ignoradas = [p.name for p in todas if p.name not in alvo]
+        return selecionadas, ignoradas
+
+    if apenas_novas:
+        novas = set(_remessas_com_arquivo_novo(pasta_raiz))
+        selecionadas = [p for p in todas if p.name in novas]
+        ignoradas = [p.name for p in todas if p.name not in novas]
+        log.info(
+            "Processamento seletivo: %d de %d remessas com arquivo novo",
+            len(selecionadas),
+            len(todas),
+        )
+        return selecionadas, ignoradas
+
+    return todas, []
+
+
+# ---------------------------------------------------------------------------
 # PROCESSAMENTO EM LOTE
 # ---------------------------------------------------------------------------
+def processar_pasta_raiz(
+    pasta_raiz: str | Path,
+    remessas: list[str] | None = None,
+    apenas_novas: bool = False,
+) -> dict:
+    """Processa as subpastas de remessa dentro da pasta raiz.
 
+    Args:
+        pasta_raiz: pasta que contém as subpastas de remessa.
+        remessas: lista explícita de números de remessa a processar.
+                  Quando informada, só essas são processadas.
+        apenas_novas: quando True, processa apenas as pastas cujo arquivo
+                  mais recente é mais novo que o último processamento
+                  registrado no arquivo de controle. Ignorado se `remessas`
+                  for informada.
 
-def processar_pasta_raiz(pasta_raiz: str | Path) -> dict:
-    """Processa todas as subpastas de remessa dentro da pasta raiz."""
+    Retorna:
+        {
+            "ok": bool,
+            "total": int,              # subpastas selecionadas
+            "processadas": int,
+            "falhas": int,
+            "ignoradas": list[str],    # subpastas fora da seleção
+            "layouts_aprendidos": int,
+            "modo": str,               # "todas" | "lista" | "novas"
+            "controle": dict,          # resumo gravado no arquivo de controle
+            "resultados": list[dict],
+        }
+    """
     db.init_db()
     ps.init_historico()
 
@@ -463,9 +655,35 @@ def processar_pasta_raiz(pasta_raiz: str | Path) -> dict:
     if not raiz.is_dir():
         return {"ok": False, "motivo": f"Pasta inválida: {raiz}"}
 
-    subpastas = sorted(p for p in raiz.iterdir() if p.is_dir())
+    subpastas, ignoradas = _selecionar_subpastas(raiz, remessas, apenas_novas)
+
+    if remessas:
+        modo = "lista"
+    elif apenas_novas:
+        modo = "novas"
+    else:
+        modo = "todas"
+
     if not subpastas:
-        return {"ok": False, "motivo": "Nenhuma subpasta de remessa encontrada"}
+        log.info("Nenhuma remessa selecionada (modo=%s)", modo)
+        return {
+            "ok": True,
+            "total": 0,
+            "processadas": 0,
+            "falhas": 0,
+            "ignoradas": ignoradas,
+            "layouts_aprendidos": 0,
+            "modo": modo,
+            "controle": _ler_controle(raiz),
+            "resultados": [],
+        }
+
+    log.info(
+        "Processando %d remessa(s) (modo=%s, %d ignorada(s))",
+        len(subpastas),
+        modo,
+        len(ignoradas),
+    )
 
     resultados = []
     for sub in subpastas:
@@ -476,13 +694,32 @@ def processar_pasta_raiz(pasta_raiz: str | Path) -> dict:
             resultados.append({"ok": False, "remessa": sub.name, "motivo": str(e)})
 
     ok = sum(1 for r in resultados if r.get("ok"))
+    falhas = len(resultados) - ok
     total_layouts = sum(len(r.get("layouts_aprendidos") or []) for r in resultados)
+
+    # Registra o instante e o resumo do processamento para o filtro da
+    # próxima execução. Só grava quando o modo é "novas": nos modos "todas"
+    # e "lista" o usuário escolheu processar de propósito, e mover o
+    # controle faria a próxima execução do modo "novas" ignorar arquivos
+    # que ainda precisam ser vistos.
+    controle = _ler_controle(raiz)
+    if modo == "novas":
+        _gravar_controle(
+            raiz,
+            total=len(resultados),
+            processadas=ok,
+            falhas=falhas,
+        )
+        controle = _ler_controle(raiz)
 
     return {
         "ok": True,
         "total": len(resultados),
         "processadas": ok,
-        "falhas": len(resultados) - ok,
+        "falhas": falhas,
+        "ignoradas": ignoradas,
         "layouts_aprendidos": total_layouts,
+        "modo": modo,
+        "controle": controle,
         "resultados": resultados,
     }

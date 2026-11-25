@@ -481,16 +481,133 @@ with abas[1]:
     st.subheader("Conciliar anexos baixados")
     st.caption(f"Processa a pasta raiz: {PASTA_ANEXOS_PADRAO}")
 
+    # ---- Estado do controle de processamento
+    import time as _time
+
+    _raiz = Path(PASTA_ANEXOS_PADRAO)
+    _controle = _raiz / ".ultimo_processamento"
+    try:
+        _dados = json.loads(_controle.read_text().strip())
+        if not isinstance(_dados, dict):
+            raise ValueError
+    except (OSError, ValueError, json.JSONDecodeError):
+        _dados = {}
+
+    _ts = float(_dados.get("timestamp") or 0.0)
+
+    col_info, col_reset = st.columns([3, 1])
+    with col_info:
+        if _ts > 0:
+            _quando = _time.strftime("%d/%m/%Y %H:%M:%S", _time.localtime(_ts))
+            st.info(f"**Ultimo processamento (modo arquivo novo):** {_quando}")
+            c_a, c_b, c_c = st.columns(3)
+            c_a.metric("Remessas", _dados.get("total", 0))
+            c_b.metric("Processadas", _dados.get("processadas", 0))
+            c_c.metric("Falhas", _dados.get("falhas", 0))
+        else:
+            st.warning(
+                "**Nenhum processamento registrado ainda.** A primeira "
+                "execucao no modo 'arquivo novo' vai processar todas as "
+                "remessas com arquivo."
+            )
+    with col_reset:
+        if st.button(
+            "Resetar controle",
+            key="btn_reset_controle",
+            help="Apaga o registro do ultimo processamento. A proxima "
+            "execucao no modo 'arquivo novo' vai reprocessar todas as "
+            "remessas com arquivo.",
+        ):
+            try:
+                _controle.unlink()
+                st.success("Controle resetado.")
+                st.rerun()
+            except FileNotFoundError:
+                st.info("O controle ja nao existia.")
+            except OSError as e:
+                st.error(f"Falha ao resetar: {e}")
+
+    st.divider()
+
+    modo = st.radio(
+        "O que processar",
+        [
+            "Somente remessas com arquivo novo",
+            "Todas as remessas",
+            "Remessas especificas",
+        ],
+        horizontal=True,
+        key="modo_conciliar",
+    )
+
+    remessas_escolhidas = None
+    apenas_novas = False
+
+    if modo == "Somente remessas com arquivo novo":
+        apenas_novas = True
+        st.caption(
+            "Processa apenas as pastas cujo arquivo mais recente e mais "
+            "novo que o ultimo processamento registrado. Evita refazer "
+            "o OCR de remessas inalteradas."
+        )
+    elif modo == "Remessas especificas":
+        try:
+            todas_remessas = sorted(p.name for p in _raiz.iterdir() if p.is_dir())
+        except Exception:
+            todas_remessas = []
+        remessas_escolhidas = st.multiselect(
+            "Remessas", todas_remessas, key="sel_conciliar"
+        )
+
     if st.button("Conciliar", type="primary", key="btn_conciliar"):
         try:
             from pipeline import processar_pasta_raiz
 
             with st.spinner("Conciliando..."):
-                retorno = processar_pasta_raiz(PASTA_ANEXOS_PADRAO)
-            st.success(
-                f"Processadas: {retorno.get('processadas', 0)} | "
-                f"Falhas: {retorno.get('falhas', 0)}"
-            )
+                retorno = processar_pasta_raiz(
+                    PASTA_ANEXOS_PADRAO,
+                    remessas=remessas_escolhidas or None,
+                    apenas_novas=apenas_novas,
+                )
+
+            if not retorno.get("ok"):
+                st.error(retorno.get("motivo") or "Falha na conciliacao.")
+            else:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Selecionadas", retorno.get("total", 0))
+                c2.metric("Processadas", retorno.get("processadas", 0))
+                c3.metric("Falhas", retorno.get("falhas", 0))
+                c4.metric("Ignoradas", len(retorno.get("ignoradas") or []))
+                st.caption(f"Modo: **{retorno.get('modo')}**")
+
+                if retorno.get("total", 0) == 0:
+                    st.warning(
+                        "Nenhuma remessa selecionada. Se voce esperava "
+                        "processar algo, mude o modo para 'Todas as remessas' "
+                        "ou clique em 'Resetar controle'."
+                    )
+
+                resultados = retorno.get("resultados") or []
+                if resultados:
+                    tabela = [
+                        {
+                            "Remessa": r.get("remessa"),
+                            "Status": r.get("status") or r.get("motivo") or "-",
+                            "Score": r.get("score"),
+                            "Guia": "OK" if r.get("guia") else "-",
+                            "Jadlog": "OK" if r.get("comp_jadlog") else "-",
+                            "Cliente": "OK" if r.get("comp_cliente") else "-",
+                        }
+                        for r in resultados
+                    ]
+                    st.dataframe(tabela, width="stretch", hide_index=True)
+
+                if retorno.get("ignoradas"):
+                    with st.expander(
+                        f"Remessas ignoradas ({len(retorno['ignoradas'])})"
+                    ):
+                        st.write(", ".join(retorno["ignoradas"]))
+
             st.cache_data.clear()
         except Exception as e:
             st.error(f"Falha na conciliacao: {e}")
