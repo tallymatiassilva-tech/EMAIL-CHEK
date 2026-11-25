@@ -6,7 +6,7 @@ numeros que claramente nao sao valor:
 
 - CNPJ (14 digitos, com ou sem pontuacao)
 - CPF (11 digitos)
-- Agência, conta, autenticacao, ID de transacao
+- Agencia, conta, autenticacao, ID de transacao
 - Datas (dd/mm/yyyy)
 - Telefones (0800, sequencias longas)
 - Codigos de barras e chaves de acesso
@@ -35,6 +35,8 @@ RE_CNPJ_NUM = re.compile(r"\b\d{14}\b")
 RE_CPF_FMT = re.compile(r"\d{3}\.\d{3}\.\d{3}-\d{2}")
 # CPF sem pontuacao
 RE_CPF_NUM = re.compile(r"\b\d{11}\b")
+# CPF mascarado: *** 151.722-**
+RE_CPF_MASCARADO = re.compile(r"\*{2,}\s*\d{3}\.\d{3}")
 # Datas
 RE_DATA = re.compile(r"\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b")
 # Telefones e 0800
@@ -103,7 +105,6 @@ def _contexto_indica_valor(texto: str, pos: int, janela: int = 80) -> bool:
     contexto = texto[inicio:fim]
 
     if ROTULOS_NAO_VALOR.search(contexto):
-        # Se tem rotulo de nao-valor mais perto que rotulo de valor, rejeita
         pos_nao_valor = ROTULOS_NAO_VALOR.search(contexto)
         pos_valor = ROTULOS_VALOR.search(contexto)
         if pos_nao_valor and (
@@ -114,13 +115,37 @@ def _contexto_indica_valor(texto: str, pos: int, janela: int = 80) -> bool:
     return bool(ROTULOS_VALOR.search(contexto))
 
 
+def _contexto_e_documento(texto: str, pos: int, janela: int = 40) -> bool:
+    """Verifica se o numero esta dentro de um CNPJ/CPF no contexto.
+
+    Diferente de _e_cnpj_ou_cpf, que valida o numero isolado, esta funcao
+    olha o texto em volta. Pega o caso em que o OCR quebra o CNPJ em
+    pedacos com virgula, como '37.242,74'.
+    """
+    inicio = max(0, pos - janela)
+    fim = min(len(texto), pos + janela)
+    contexto = texto[inicio:fim]
+
+    if RE_CNPJ_FMT.search(contexto):
+        return True
+    if RE_CPF_FMT.search(contexto):
+        return True
+    if RE_CPF_MASCARADO.search(contexto):
+        return True
+
+    # Rotulo explicito imediatamente antes
+    antes = texto[max(0, pos - 40) : pos]
+    if re.search(r"(?:CPF|CNPJ)\s*:?\s*\*{0,3}\s*$", antes, re.IGNORECASE):
+        return True
+
+    return False
+
+
 def _candidato_valido(texto: str, bruto: str, pos: int, valor: float) -> bool:
     """Aplica todas as regras de rejeicao a um candidato."""
-    # Faixa plausivel de reembolso
     if not (0.01 <= valor <= 100_000):
         return False
 
-    # Nao e CNPJ, CPF, data, telefone ou ID
     if _e_cnpj_ou_cpf(bruto):
         return False
     if _e_data(bruto):
@@ -130,7 +155,10 @@ def _candidato_valido(texto: str, bruto: str, pos: int, valor: float) -> bool:
     if _e_chave_ou_id(bruto):
         return False
 
-    # Precisa de contexto de valor OU estar formatado como moeda
+    # NOVO: rejeita se o numero esta dentro de CNPJ/CPF no contexto
+    if _contexto_e_documento(texto, pos):
+        return False
+
     if RE_MOEDA.fullmatch(bruto):
         return True
 
@@ -162,8 +190,7 @@ def valor_tolerante(texto: str, caminho: Path | None = None) -> float | None:
     Estrategias, em ordem de confianca:
 
     1. Valor formatado como moeda perto de rotulo de valor
-       ("R$ 65,00", "Valor pago: 1.234,56")
-    2. Valor formatado como moeda em qualquer lugar do texto
+    2. Valor formatado como moeda perto de R$ ou de rotulo de valor
     3. Numero perto de rotulo de valor, sem ser CNPJ/CPF/data/ID
     4. Nome do arquivo (quando o valor esta no nome, ex: "240,61.pdf")
 
@@ -182,11 +209,15 @@ def valor_tolerante(texto: str, caminho: Path | None = None) -> float | None:
             continue
         if not (0.01 <= valor <= 100_000):
             continue
+        if _contexto_e_documento(texto, m.start()):
+            continue
         if _contexto_indica_valor(texto, m.start()):
             log.debug("Valor por moeda + rotulo: %s", bruto)
             return valor
 
-    # 2) Moeda em qualquer lugar (formato ja e forte o suficiente)
+    # 2) Moeda com contexto de R$ ou rotulo de valor
+    # Antes aceitava qualquer moeda isolada, o que pegava numeros de
+    # transacao. Agora exige contexto.
     candidatos = []
     for m in RE_MOEDA.finditer(texto):
         bruto = m.group(1)
@@ -197,11 +228,19 @@ def valor_tolerante(texto: str, caminho: Path | None = None) -> float | None:
             continue
         if _e_cnpj_ou_cpf(bruto) or _e_data(bruto):
             continue
-        candidatos.append(valor)
+        if _contexto_e_documento(texto, m.start()):
+            continue
+
+        antes = texto[max(0, m.start() - 20) : m.start()]
+        if re.search(r"R\$\s*$", antes):
+            candidatos.append(valor)
+            continue
+        if _contexto_indica_valor(texto, m.start()):
+            candidatos.append(valor)
 
     if candidatos:
         valor = max(candidatos)
-        log.debug("Valor por moeda isolada: %s", valor)
+        log.debug("Valor por moeda com contexto: %s", valor)
         return valor
 
     # 3) Numero perto de rotulo de valor, com validacao de contexto
@@ -219,10 +258,15 @@ def valor_tolerante(texto: str, caminho: Path | None = None) -> float | None:
         nome = Path(caminho).stem
         m = re.search(r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})", nome)
         if m:
-            valor = _para_float(m.group(1))
-            if valor and 0.01 <= valor <= 100_000:
-                log.debug("Valor pelo nome do arquivo: %s", m.group(1))
-                return valor
+            bruto = m.group(1)
+            # NOVO: rejeita se o nome do arquivo parece CNPJ/CPF
+            if _e_cnpj_ou_cpf(bruto):
+                log.debug("Nome do arquivo parece CNPJ/CPF, ignorado")
+            else:
+                valor = _para_float(bruto)
+                if valor and 0.01 <= valor <= 100_000:
+                    log.debug("Valor pelo nome do arquivo: %s", bruto)
+                    return valor
 
     log.debug("Nenhum valor seguro encontrado")
     return None

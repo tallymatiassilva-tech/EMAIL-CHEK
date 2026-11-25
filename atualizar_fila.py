@@ -1,11 +1,22 @@
 """Regrava a fila de treinamento com os valores do motor atual.
 
-A fila guarda o resultado da extração no momento em que o arquivo foi
+A fila guarda o resultado da extracao no momento em que o arquivo foi
 enfileirado. Quando o motor melhora, os itens antigos ficam com valores
 desatualizados (None). Este script recalcula e regrava.
 
+TRAVA DE REVISAO MANUAL:
+Itens com editado_manualmente = True sao PULADOS. O valor digitado pela
+equipe nunca e sobrescrito pelo motor. Isso e essencial nos casos de OCR
+corrompido, onde o motor sempre retorna None e a revisao humana e a unica
+fonte correta.
+
+CAMINHO DO ARQUIVO:
+O caminho e lido em duas fontes, nesta ordem:
+1. chave "caminho" dentro do campos_json (formato novo)
+2. coluna caminho_arquivo da tabela (formato antigo)
+
 Uso:
-    python atualizar_fila.py            # só pendentes (resolvido = 0)
+    python atualizar_fila.py            # so pendentes (resolvido = 0)
     python atualizar_fila.py --todos    # todos os itens
 """
 
@@ -17,10 +28,7 @@ import database as db
 import pdf_reader
 from config import TipoDoc
 
-# Campos que, se vazios, entram na lista "faltando"
 CAMPOS_OBRIGATORIOS = ["valor_reembolso", "data_reembolso"]
-
-# Tipos de documento que este script sabe recalcular
 TIPOS_SUPORTADOS = {TipoDoc.COMP_CLIENTE}
 
 
@@ -40,11 +48,27 @@ def _campos_do_json(campos_json: str | None) -> dict:
     return dados.get("campos", dados) or {}
 
 
-def recalcular_item(campos_json: str) -> dict | None:
+def _resolver_caminho(dados: dict, caminho_coluna: str | None) -> str:
+    """Resolve o caminho do arquivo a partir das duas fontes disponiveis.
+
+    Prioriza a chave "caminho" dentro do JSON. Se ela nao existir, usa a
+    coluna caminho_arquivo da tabela.
+    """
+    campos = dados.get("campos", dados) or {}
+    caminho_json = campos.get("caminho")
+    if caminho_json:
+        return str(caminho_json)
+    if caminho_coluna:
+        return str(caminho_coluna)
+    return ""
+
+
+def recalcular_item(campos_json: str, caminho_coluna: str | None = None) -> dict | None:
     """Recalcula um item da fila chamando o motor atual.
 
     Retorna o novo dicionario {campos, faltando, texto, confianca} ou None
-    se o arquivo nao existir mais ou o motor falhar.
+    se o item foi revisado manualmente, o arquivo nao existe mais ou o
+    motor falhar.
 
     Preserva as chaves extras do JSON original (_rotulos, editado_manualmente
     e qualquer outra), sobrescrevendo apenas campos, faltando, texto e
@@ -58,8 +82,12 @@ def recalcular_item(campos_json: str) -> dict | None:
         return None
 
     campos_antigos = dados.get("campos", dados) or {}
-    caminho = campos_antigos.get("caminho")
 
+    # TRAVA: item revisado manualmente nao e reprocessado
+    if campos_antigos.get("editado_manualmente"):
+        return None
+
+    caminho = _resolver_caminho(dados, caminho_coluna)
     if not caminho:
         return None
 
@@ -73,7 +101,15 @@ def recalcular_item(campos_json: str) -> dict | None:
         print("  erro em " + arquivo.name + ": " + str(e))
         return None
 
-    campos_novos = dict(campos_antigos)
+    # Garante a estrutura {"campos": {...}} sem referencias circulares
+    if "campos" in dados and isinstance(dados["campos"], dict):
+        campos_base = dict(dados["campos"])
+        resultado = dict(dados)
+    else:
+        campos_base = dict(dados)
+        resultado = {}
+
+    campos_novos = dict(campos_base)
     campos_novos.update(
         {
             "nome_pagador": novo.get("nome_pagador") or "",
@@ -86,31 +122,27 @@ def recalcular_item(campos_json: str) -> dict | None:
             "agencia": novo.get("agencia") or "",
             "conta": novo.get("conta") or "",
             "confianca": novo.get("confianca", 0),
-            "tipo": novo.get("tipo") or campos_antigos.get("tipo"),
-            "numero_remessa": campos_antigos.get("numero_remessa"),
+            "tipo": novo.get("tipo") or campos_base.get("tipo"),
+            "numero_remessa": campos_base.get("numero_remessa"),
             "caminho": caminho,
         }
     )
 
     faltando = [c for c in CAMPOS_OBRIGATORIOS if not campos_novos.get(c)]
 
-    # Parte do JSON original para preservar _rotulos e chaves extras
-    resultado = dict(dados)
     resultado["campos"] = campos_novos
     resultado["faltando"] = faltando
     resultado["texto"] = novo.get("texto") or dados.get("texto", "")
     resultado["confianca"] = novo.get("confianca", 0)
-
     return resultado
 
 
 def atualizar_fila(somente_pendentes: bool = True) -> None:
     filtro = "WHERE resolvido = 0" if somente_pendentes else ""
     sql = (
-        "SELECT id, tipo_documento, campos_json, confianca "
+        "SELECT id, tipo_documento, campos_json, confianca, caminho_arquivo "
         "FROM fila_treinamento " + filtro
     )
-
     with db.cursor() as cur:
         cur.execute(sql)
         itens = cur.fetchall()
@@ -121,25 +153,31 @@ def atualizar_fila(somente_pendentes: bool = True) -> None:
     melhorados = 0
     falhas = 0
     ignorados = 0
+    preservados = 0
 
     for row in itens:
         item_id = row["id"]
         tipo = row["tipo_documento"]
         campos_json = row["campos_json"]
         conf_antiga = row["confianca"] or 0
+        caminho_coluna = row["caminho_arquivo"]
 
         if tipo not in TIPOS_SUPORTADOS:
             ignorados += 1
             continue
 
-        novo = recalcular_item(campos_json)
+        # Pula itens revisados manualmente
+        if _campos_do_json(campos_json).get("editado_manualmente"):
+            preservados += 1
+            continue
+
+        novo = recalcular_item(campos_json, caminho_coluna)
         if not novo:
             falhas += 1
             continue
 
         conf_nova = novo["confianca"]
         valor = novo["campos"].get("valor_reembolso")
-
         valor_antigo = _campos_do_json(campos_json).get("valor_reembolso")
 
         with db.cursor() as cur:
@@ -169,6 +207,7 @@ def atualizar_fila(somente_pendentes: bool = True) -> None:
     print("")
     print("Atualizados: " + str(atualizados))
     print("Melhorados:  " + str(melhorados))
+    print("Preservados: " + str(preservados) + "  (revisao manual)")
     print("Ignorados:   " + str(ignorados))
     print("Falhas:      " + str(falhas))
 

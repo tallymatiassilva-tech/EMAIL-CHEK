@@ -346,12 +346,11 @@ abas = st.tabs(
         "4. Exportar Excel",
         "5. Estatisticas",
         "6. Fila",
-        "7. Resolver fila",
+        "7. Revisao manual",
         "8. Layouts",
-        "9. Validacao",
-        "10. Reprocessar",
-        "11. Backup",
-        "12. Reprocessar fila",
+        "9. Reprocessar",
+        "10. Backup",
+        "11. Reprocessar fila",
     ]
 )
 
@@ -602,347 +601,657 @@ with abas[5]:
     except Exception as e:
         st.warning(f"Nao foi possivel ler a fila: {e}")
 
-# ---- 7. resolver fila (EDICAO + LOTE + FILTRO + EXPORT)
+# ---- 7. REVISAO MANUAL (fila + remessas em divergencia)
 with abas[6]:
-    st.subheader("Resolver itens da fila")
+    st.subheader("Revisao manual")
     st.caption(
-        "Edite os campos extraidos, reclassifique o documento e vincule a "
-        "remessa. Ao salvar, a remessa e reprocessada automaticamente."
+        "Tudo o que precisa de atencao humana em um lugar so. Escolha a visao abaixo."
     )
 
-    try:
-        pendentes = consultar(
-            "SELECT id, tipo_documento, numero_remessa, confianca, "
-            "caminho_arquivo, campos_json FROM fila_treinamento "
-            "WHERE resolvido = 0 ORDER BY confianca ASC"
-        )
+    visao = st.radio(
+        "O que revisar",
+        ["Campos faltando", "Remessas em divergencia"],
+        horizontal=True,
+        key="visao_revisao",
+    )
 
-        if not pendentes:
-            st.info("Nenhum item pendente na fila.")
-        else:
-            pendentes = _preparar_itens(pendentes)
-            total = len(pendentes)
-            por_sev = {
-                s: sum(1 for p in pendentes if p["_severidade"] == s) for s in range(4)
-            }
-
-            # Metricas
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Pendentes", total)
-            c2.metric("Criticos", por_sev[0], delta_color="inverse")
-            c3.metric("Alto", por_sev[1], delta_color="inverse")
-            c4.metric("Medio", por_sev[2], delta_color="inverse")
-            c5.metric("Baixo", por_sev[3], delta_color="inverse")
-
-            if por_sev[0] > 0:
-                st.warning(
-                    f"**{por_sev[0]} item(ns) critico(s)** com valor ausente. "
-                    "Precisam de correcao manual. Aparecem primeiro na lista."
-                )
-
-            # Filtros + botao de criticos + export
-            st.divider()
-            st.write("**Filtros**")
-
-            sev_filtro, tipos_filtro, remessas_filtro = _render_filtros(
-                pendentes, "resolver"
+    # ================================================================
+    # VISAO 1 — CAMPOS FALTANDO (fila de treinamento)
+    # ================================================================
+    if visao == "Campos faltando":
+        st.divider()
+        try:
+            pendentes = consultar(
+                "SELECT id, tipo_documento, numero_remessa, confianca, "
+                "caminho_arquivo, campos_json FROM fila_treinamento "
+                "WHERE resolvido = 0 ORDER BY confianca ASC"
             )
-
-            col_btn1, col_btn2 = st.columns([1, 1])
-            if col_btn1.button(
-                "🔴 Mostrar so itens criticos",
-                key="btn_so_criticos",
-            ):
-                st.session_state["resolver_sev"] = ["🔴 Critico (valor)"]
-                st.rerun()
-
-            filtrados = _filtrar_itens(
-                pendentes, sev_filtro, tipos_filtro, remessas_filtro
-            )
-
-            # Export dos criticos
-            criticos = [p for p in pendentes if p["_severidade"] == 0]
-            if criticos:
-                try:
-                    excel_bytes = _gerar_excel_criticos(criticos)
-                    col_btn2.download_button(
-                        f"📥 Exportar {len(criticos)} criticos (Excel)",
-                        data=excel_bytes,
-                        file_name="itens_criticos.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument."
-                        "spreadsheetml.sheet",
-                        key="btn_export_criticos",
-                    )
-                except Exception as e:
-                    col_btn2.caption(f"Export indisponivel: {e}")
-
-            st.caption(f"Mostrando {len(filtrados)} de {total} itens")
-
-            if not filtrados:
-                st.info("Nenhum item corresponde aos filtros.")
+            if not pendentes:
+                st.info("Nenhum item pendente na fila.")
             else:
-                # Ordena por severidade
-                filtrados.sort(
-                    key=lambda x: (x["_severidade"], x["confianca"] or 0, -x["id"])
+                pendentes = _preparar_itens(pendentes)
+                total = len(pendentes)
+                por_sev = {
+                    s: sum(1 for p in pendentes if p["_severidade"] == s)
+                    for s in range(4)
+                }
+                revisados = [
+                    p
+                    for p in pendentes
+                    if _campos_do_json(p.get("campos_json")).get("editado_manualmente")
+                ]
+                pendentes_revisao = [
+                    p
+                    for p in pendentes
+                    if not _campos_do_json(p.get("campos_json")).get(
+                        "editado_manualmente"
+                    )
+                    and (p["_valor_ausente"] or p["_data_ausente"])
+                ]
+
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Pendentes", total)
+                c2.metric("Criticos", por_sev[0], delta_color="inverse")
+                c3.metric("Alto", por_sev[1], delta_color="inverse")
+                c4.metric("Medio", por_sev[2], delta_color="inverse")
+                c5.metric("Baixo", por_sev[3], delta_color="inverse")
+
+                if por_sev[0] > 0:
+                    st.warning(
+                        f"**{por_sev[0]} item(ns) critico(s)** com valor "
+                        "ausente. Aparecem primeiro na lista."
+                    )
+
+                st.divider()
+                st.write("**Filtros**")
+                sev_filtro, tipos_filtro, remessas_filtro = _render_filtros(
+                    pendentes, "resolver"
                 )
 
-                opcoes = {}
-                for p in filtrados:
-                    label = (
-                        f"{p['_severidade_label']} #{p['id']} — "
-                        f"{Path(p['caminho_arquivo']).name} "
-                        f"({p['tipo_documento']}, conf {p['confianca']})"
-                    )
-                    opcoes[label] = p
+                col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
+                if col_btn1.button(
+                    "🔴 Mostrar so itens criticos",
+                    key="btn_so_criticos",
+                ):
+                    st.session_state["resolver_sev"] = ["🔴 Critico (valor)"]
+                    st.rerun()
 
-                escolha = st.selectbox("Item", list(opcoes.keys()), key="sel_fila")
-                item = opcoes[escolha]
+                if col_btn2.button(
+                    f"📝 So revisao manual ({len(pendentes_revisao)})",
+                    key="btn_so_pendentes_revisao",
+                    help="Mostra apenas itens sem valor ou sem data, "
+                    "excluindo os ja revisados manualmente.",
+                ):
+                    st.session_state["resolver_so_revisao"] = True
+                    st.rerun()
 
-                # Aviso destacado do item selecionado
-                if item["_severidade"] == 0:
-                    st.error(
-                        f"**Item critico — valor ausente.** {item['_motivo']}. "
-                        f"Campos faltando: {', '.join(item['_campos_ausentes'])}. "
-                        "Preencha manualmente abaixo."
-                    )
-                elif item["_severidade"] == 1:
-                    st.warning(
-                        f"**Item de severidade alta — data ausente.** "
-                        f"{item['_motivo']}. "
-                        f"Campos faltando: {', '.join(item['_campos_ausentes'])}."
-                    )
-                elif item["_severidade"] in (2, 3):
+                if col_btn3.button(
+                    "🔄 Limpar filtros",
+                    key="btn_limpar_filtros",
+                ):
+                    st.session_state.pop("resolver_so_revisao", None)
+                    st.session_state.pop("resolver_sev", None)
+                    st.rerun()
+
+                filtrados = _filtrar_itens(
+                    pendentes, sev_filtro, tipos_filtro, remessas_filtro
+                )
+
+                if st.session_state.get("resolver_so_revisao"):
+                    ids_revisao = {p["id"] for p in pendentes_revisao}
+                    filtrados = [p for p in filtrados if p["id"] in ids_revisao]
                     st.info(
-                        f"**Campos secundarios ausentes.** {item['_motivo']}. "
-                        f"Faltando: {', '.join(item['_campos_ausentes'])}."
+                        f"Filtro ativo: mostrando apenas os "
+                        f"{len(filtrados)} itens pendentes de revisao."
                     )
 
-                campos_atuais = _campos_do_json(item.get("campos_json"))
-
-                col_doc, col_form = st.columns([1, 1])
-                with col_doc:
-                    st.write("**Documento**")
-                    mostrar_documento(item["caminho_arquivo"], altura=460)
-
-                with col_form:
-                    st.write("**Edicao**")
-
-                    tipos = [
-                        "GUIA_FISCAL",
-                        "COMPROVANTE_JADLOG",
-                        "COMPROVANTE_REEMBOLSO",
-                        "PLANILHA",
-                        "DESCONHECIDO",
-                    ]
-                    tipo_atual = item["tipo_documento"]
-                    idx_tipo = tipos.index(tipo_atual) if tipo_atual in tipos else 0
-                    novo_tipo = st.selectbox(
-                        "Tipo do documento",
-                        tipos,
-                        index=idx_tipo,
-                        key=f"tipo_{item['id']}",
-                    )
-
-                    remessas = [
-                        r["numero_remessa"]
-                        for r in consultar(
-                            "SELECT DISTINCT numero_remessa FROM reembolsos "
-                            "WHERE numero_remessa IS NOT NULL "
-                            "ORDER BY numero_remessa DESC"
+                criticos = [p for p in pendentes if p["_severidade"] == 0]
+                if criticos:
+                    try:
+                        excel_bytes = _gerar_excel_criticos(criticos)
+                        st.download_button(
+                            f"📥 Exportar {len(criticos)} criticos (Excel)",
+                            data=excel_bytes,
+                            file_name="itens_criticos.xlsx",
+                            mime="application/vnd.openxmlformats-"
+                            "officedocument.spreadsheetml.sheet",
+                            key="btn_export_criticos",
                         )
-                    ]
-                    rem_atual = item["numero_remessa"]
-                    idx_rem = remessas.index(rem_atual) if rem_atual in remessas else 0
-                    nova_remessa = st.selectbox(
-                        "Remessa vinculada",
-                        remessas or [rem_atual],
-                        index=idx_rem if remessas else 0,
-                        key=f"rem_{item['id']}",
+                    except Exception as e:
+                        st.caption(f"Export indisponivel: {e}")
+
+                st.caption(f"Mostrando {len(filtrados)} de {total} itens")
+                if not filtrados:
+                    st.info("Nenhum item corresponde aos filtros.")
+                else:
+                    filtrados.sort(
+                        key=lambda x: (
+                            x["_severidade"],
+                            x["confianca"] or 0,
+                            -x["id"],
+                        )
                     )
+                    opcoes = {}
+                    for p in filtrados:
+                        campos_p = _campos_do_json(p.get("campos_json"))
+                        marca_revisao = (
+                            " ✅" if campos_p.get("editado_manualmente") else ""
+                        )
+                        label = (
+                            f"{p['_severidade_label']} #{p['id']} — "
+                            f"{Path(p['caminho_arquivo']).name} "
+                            f"({p['tipo_documento']}, conf {p['confianca']})"
+                            f"{marca_revisao}"
+                        )
+                        opcoes[label] = p
 
-                    st.divider()
-                    st.write("**Campos extraidos**")
+                    escolha = st.selectbox("Item", list(opcoes.keys()), key="sel_fila")
+                    item = opcoes[escolha]
+                    campos_atuais = _campos_do_json(item.get("campos_json"))
+                    ja_revisado = bool(campos_atuais.get("editado_manualmente"))
 
-                    def _campo(chave: str, rotulo: str, tipo_input: str = "text"):
-                        valor = campos_atuais.get(chave)
-                        vazio = valor in (None, "", 0, 0.0)
-                        label = f"{rotulo} ⚠️" if vazio else rotulo
-                        if tipo_input == "number":
-                            return st.number_input(
+                    if ja_revisado:
+                        st.success(
+                            "**Item ja revisado manualmente.** Os valores "
+                            "abaixo foram digitados por uma pessoa e estao "
+                            "protegidos contra sobrescrita do motor."
+                        )
+                    elif item["_severidade"] == 0:
+                        st.error(
+                            f"**Item critico — valor ausente.** "
+                            f"{item['_motivo']}. Campos faltando: "
+                            f"{', '.join(item['_campos_ausentes'])}."
+                        )
+                    elif item["_severidade"] == 1:
+                        st.warning(
+                            f"**Severidade alta — data ausente.** "
+                            f"{item['_motivo']}. Campos faltando: "
+                            f"{', '.join(item['_campos_ausentes'])}."
+                        )
+                    elif item["_severidade"] in (2, 3):
+                        st.info(
+                            f"**Campos secundarios ausentes.** "
+                            f"{item['_motivo']}. Faltando: "
+                            f"{', '.join(item['_campos_ausentes'])}."
+                        )
+
+                    col_doc, col_form = st.columns([1, 1])
+                    with col_doc:
+                        st.write("**Documento**")
+                        mostrar_documento(item["caminho_arquivo"], altura=460)
+                    with col_form:
+                        st.write("**Edicao**")
+                        tipos = [
+                            "GUIA_FISCAL",
+                            "COMPROVANTE_JADLOG",
+                            "COMPROVANTE_REEMBOLSO",
+                            "PLANILHA",
+                            "DESCONHECIDO",
+                        ]
+                        tipo_atual = item["tipo_documento"]
+                        idx_tipo = tipos.index(tipo_atual) if tipo_atual in tipos else 0
+                        novo_tipo = st.selectbox(
+                            "Tipo do documento",
+                            tipos,
+                            index=idx_tipo,
+                            key=f"tipo_{item['id']}",
+                        )
+
+                        remessas = [
+                            r["numero_remessa"]
+                            for r in consultar(
+                                "SELECT DISTINCT numero_remessa "
+                                "FROM reembolsos "
+                                "WHERE numero_remessa IS NOT NULL "
+                                "ORDER BY numero_remessa DESC"
+                            )
+                        ]
+                        rem_atual = item["numero_remessa"]
+                        idx_rem = (
+                            remessas.index(rem_atual) if rem_atual in remessas else 0
+                        )
+                        nova_remessa = st.selectbox(
+                            "Remessa vinculada",
+                            remessas or [rem_atual],
+                            index=idx_rem if remessas else 0,
+                            key=f"rem_{item['id']}",
+                        )
+
+                        st.divider()
+                        st.write("**Campos extraidos**")
+
+                        campos_do_tipo = CAMPOS_POR_TIPO.get(novo_tipo, [])
+                        rotulos_campos = {
+                            "valor_reembolso": "Valor do reembolso",
+                            "data_reembolso": "Data do reembolso",
+                            "cnpj_pagador": "CNPJ",
+                            "nome_pagador": "Nome pagador",
+                            "valor_pago_jadlog": "Valor pago Jadlog",
+                            "data_pagamento_jadlog": "Data pagamento Jadlog",
+                            "beneficiario": "Beneficiario",
+                            "autenticacao": "Autenticacao",
+                            "valor_guia": "Valor da guia",
+                            "data_emissao": "Data de emissao",
+                            "data_vencimento": "Data de vencimento",
+                            "cnpj": "CNPJ contribuinte",
+                            "numero_nf": "Numero da NF",
+                            "numero_guia": "Numero da guia",
+                        }
+                        campos_numericos = {
+                            "valor_reembolso",
+                            "valor_pago_jadlog",
+                            "valor_guia",
+                        }
+
+                        def _campo(
+                            chave: str,
+                            rotulo: str,
+                            numerico: bool = False,
+                        ):
+                            valor = campos_atuais.get(chave)
+                            vazio = valor in (None, "", 0, 0.0)
+                            marca = "⚠️" if vazio else "✅"
+                            label = f"{marca} {rotulo}"
+                            if numerico:
+                                return st.number_input(
+                                    label,
+                                    value=(float(valor) if not vazio else 0.0),
+                                    step=0.01,
+                                    format="%.2f",
+                                    key=f"{chave}_{item['id']}",
+                                )
+                            return st.text_input(
                                 label,
-                                value=float(valor) if not vazio else 0.0,
-                                step=0.01,
-                                format="%.2f",
+                                value=str(valor) if not vazio else "",
                                 key=f"{chave}_{item['id']}",
                             )
-                        return st.text_input(
-                            label,
-                            value=str(valor) if not vazio else "",
-                            key=f"{chave}_{item['id']}",
+
+                        editados = {}
+
+                        if not campos_do_tipo:
+                            st.info(
+                                f"Tipo **{novo_tipo}** nao tem campos "
+                                "obrigatorios definidos. Use o expander "
+                                "abaixo para editar."
+                            )
+                        else:
+                            faltando = [
+                                c
+                                for c, _sev, _cat in campos_do_tipo
+                                if campos_atuais.get(c) in (None, "", 0, 0.0)
+                            ]
+                            if faltando:
+                                st.warning(
+                                    f"**{len(faltando)} campo(s) "
+                                    f"faltando:** {', '.join(faltando)}"
+                                )
+                            else:
+                                st.success("Todos os campos do tipo estao preenchidos.")
+
+                            for chave, _sev, _cat in campos_do_tipo:
+                                rotulo = rotulos_campos.get(chave, chave)
+                                editados[chave] = _campo(
+                                    chave,
+                                    rotulo,
+                                    numerico=chave in campos_numericos,
+                                )
+
+                        with st.expander(
+                            "Ver todos os campos (inclusive fora do tipo)"
+                        ):
+                            st.caption(
+                                "Campos que nao pertencem ao tipo "
+                                "selecionado. Editar aqui so faz sentido "
+                                "se o documento tiver informacao extra."
+                            )
+                            for chave, rotulo in rotulos_campos.items():
+                                if chave in editados:
+                                    continue
+                                editados[chave] = _campo(
+                                    chave,
+                                    rotulo,
+                                    numerico=chave in campos_numericos,
+                                )
+
+                        st.divider()
+                        nova_confianca = st.slider(
+                            "Confianca",
+                            min_value=0,
+                            max_value=100,
+                            value=int(item["confianca"] or 0),
+                            key=f"conf_{item['id']}",
                         )
 
-                    editados = {}
-                    editados["valor_reembolso"] = _campo(
-                        "valor_reembolso", "Valor do reembolso", "number"
-                    )
-                    editados["valor_guia"] = _campo(
-                        "valor_guia", "Valor da guia", "number"
-                    )
-                    editados["cnpj_pagador"] = _campo("cnpj_pagador", "CNPJ")
-                    editados["nome_pagador"] = _campo("nome_pagador", "Nome pagador")
-                    editados["data_reembolso"] = _campo(
-                        "data_reembolso", "Data do reembolso"
-                    )
-                    editados["data_pagamento_jadlog"] = _campo(
-                        "data_pagamento_jadlog", "Data pagamento Jadlog"
-                    )
-                    editados["numero_nf"] = _campo("numero_nf", "Numero da NF")
-                    editados["numero_guia"] = _campo("numero_guia", "Numero da guia")
+                        marcar_resolvido = st.checkbox(
+                            "Marcar como resolvido (sai da fila)",
+                            value=True,
+                            key=f"resolv_{item['id']}",
+                            help="Marcado: o item sai da fila ao salvar. "
+                            "Desmarque para manter na fila e conferir "
+                            "depois.",
+                        )
 
+                        reprocessar_agora = st.checkbox(
+                            "Reprocessar a remessa ao salvar",
+                            value=True,
+                            key=f"reproc_{item['id']}",
+                        )
+
+                        if st.button("Salvar e reprocessar", type="primary"):
+                            novos_campos = dict(campos_atuais)
+                            for k, v in editados.items():
+                                if v not in (None, ""):
+                                    novos_campos[k] = v
+
+                            novos_campos["editado_manualmente"] = True
+
+                            novo_json = _ler_json_bruto(item.get("campos_json"))
+                            novo_json["campos"] = novos_campos
+                            novo_json["confianca"] = nova_confianca
+                            novo_json["editado_manualmente"] = True
+                            novo_json["faltando"] = [
+                                c
+                                for c in (
+                                    "valor_reembolso",
+                                    "data_reembolso",
+                                )
+                                if not novos_campos.get(c)
+                            ]
+
+                            executar(
+                                "UPDATE fila_treinamento "
+                                "SET campos_json = ?, confianca = ?, "
+                                "tipo_documento = ?, numero_remessa = ?, "
+                                "resolvido = ? WHERE id = ?",
+                                (
+                                    json.dumps(novo_json, ensure_ascii=False),
+                                    nova_confianca,
+                                    novo_tipo,
+                                    nova_remessa,
+                                    1 if marcar_resolvido else 0,
+                                    item["id"],
+                                ),
+                            )
+
+                            if nova_remessa and (
+                                novos_campos.get("valor_reembolso")
+                                or novos_campos.get("data_reembolso")
+                            ):
+                                executar(
+                                    "UPDATE reembolsos SET "
+                                    "valor_reembolso_cliente = ?, "
+                                    "data_reembolso_cliente = ?, "
+                                    "data_atualizacao = datetime('now') "
+                                    "WHERE numero_remessa = ?",
+                                    (
+                                        novos_campos.get("valor_reembolso"),
+                                        novos_campos.get("data_reembolso"),
+                                        nova_remessa,
+                                    ),
+                                )
+
+                            status_msg = (
+                                "marcado como resolvido"
+                                if marcar_resolvido
+                                else "mantido na fila"
+                            )
+                            st.success(
+                                f"Item #{item['id']} atualizado: "
+                                f"tipo={novo_tipo}, "
+                                f"remessa={nova_remessa}, "
+                                f"conf={nova_confianca}, {status_msg}."
+                            )
+
+                            if reprocessar_agora and nova_remessa:
+                                try:
+                                    from reprocessar import (
+                                        reprocessar_lote,
+                                    )
+
+                                    with st.spinner(f"Reprocessando {nova_remessa}..."):
+                                        ret = reprocessar_lote([nova_remessa])
+                                    st.info(
+                                        f"Reprocessamento: "
+                                        f"{ret.get('processadas', 0)} "
+                                        f"processadas, "
+                                        f"{ret.get('falhas', 0)} falhas."
+                                    )
+                                    for r in ret.get("resultados", []):
+                                        st.write(
+                                            f"**{r['remessa']}** → "
+                                            f"{r['status']} "
+                                            f"(score {r.get('score')})"
+                                        )
+                                except Exception as e:
+                                    st.warning(f"Reprocessamento falhou: {e}")
+
+                            st.cache_data.clear()
+                            st.rerun()
+
+            # Lote
+            st.divider()
+            st.write("**Reprocessamento em lote**")
+            st.caption(
+                "Roda o OCR e a extracao em todos os itens pendentes. "
+                "Use o dry-run para ver o resultado antes de gravar. "
+                "Itens revisados manualmente sao preservados."
+            )
+            col_lim, col_dry = st.columns(2)
+            limite_lote = col_lim.number_input(
+                "Limite de itens (0 = todos)",
+                min_value=0,
+                value=0,
+                key="reproc_limite",
+            )
+            dry_run = col_dry.checkbox(
+                "Dry-run (nao grava)",
+                value=True,
+                key="reproc_dry",
+            )
+            if st.button("Reprocessar fila", type="primary", key="btn_reproc_fila"):
+                try:
+                    from reprocessar_fila import reprocessar
+
+                    with st.spinner("Reprocessando a fila..."):
+                        ret = reprocessar(
+                            limite=int(limite_lote) or None,
+                            aplicar=not dry_run,
+                        )
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Processados", ret["total"])
+                    c2.metric("Resolvidos", ret["resolvidos"])
+                    c3.metric(
+                        "Falhando",
+                        ret["faltando"]
+                        if "faltando" in ret
+                        else ret.get("falhando", 0),
+                    )
+                    c4.metric("Erros", ret["erros"])
+                    if ret["aplicado"]:
+                        st.success("Campos gravados no banco.")
+                    else:
+                        st.info("Dry-run: nada foi gravado.")
+                    if ret.get("detalhes"):
+                        tabela = []
+                        for d in ret["detalhes"]:
+                            if d["status"] == "RESOLVIDO":
+                                marca = "🟢"
+                            elif d["status"] == "ERRO":
+                                marca = "⚫"
+                            else:
+                                marca = "🔴"
+                            tabela.append(
+                                {
+                                    "Status": f"{marca} {d['status']}",
+                                    "ID": d["id"],
+                                    "Arquivo": d["arquivo"],
+                                    "Tipo": d["tipo"],
+                                    "Confianca": d["confianca"],
+                                    "Faltando": ", ".join(d["faltando"]) or "-",
+                                }
+                            )
+                        st.dataframe(tabela, width="stretch", hide_index=True)
+                        with st.expander("Ver campos extraidos por item"):
+                            for d in ret["detalhes"]:
+                                st.write(
+                                    f"**#{d['id']} — {d['arquivo']}** ({d['status']})"
+                                )
+                                st.json(d["depois"])
+                    st.cache_data.clear()
+                    if ret["aplicado"]:
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Falha no reprocessamento: {e}")
+        except Exception as e:
+            st.warning(f"Nao foi possivel carregar a fila: {e}")
+
+    # ================================================================
+    # VISAO 2 — REMESSAS EM DIVERGENCIA
+    # ================================================================
+    else:
+        st.divider()
+        try:
+            if "reembolsos" not in tabelas_existentes():
+                st.info("Tabela reembolsos nao encontrada.")
+            else:
+                divergentes = consultar(
+                    "SELECT * FROM reembolsos "
+                    "WHERE status LIKE 'DIVERGENCIA%' "
+                    "OR status = 'REVISAO_MANUAL' "
+                    "OR status = 'AGUARDANDO_REEMBOLSO' "
+                    "ORDER BY data_atualizacao DESC"
+                )
+                col_m1, col_m2, col_m3 = st.columns(3)
+                col_m1.metric("Em divergencia", len(divergentes))
+                col_m2.metric(
+                    "Divergencia de valor",
+                    len([d for d in divergentes if "VALOR" in (d.get("status") or "")]),
+                )
+                col_m3.metric(
+                    "Divergencia de CNPJ",
+                    len([d for d in divergentes if "CNPJ" in (d.get("status") or "")]),
+                )
+
+                if not divergentes:
+                    st.success("Nenhuma remessa pendente de validacao.")
+                else:
                     st.divider()
-                    nova_confianca = st.slider(
-                        "Confianca",
-                        min_value=0,
-                        max_value=100,
-                        value=int(item["confianca"] or 0),
-                        key=f"conf_{item['id']}",
+                    status_disponiveis = sorted(
+                        {d.get("status") for d in divergentes if d.get("status")}
                     )
-                    reprocessar_agora = st.checkbox(
-                        "Reprocessar a remessa ao salvar",
-                        value=True,
-                        key=f"reproc_{item['id']}",
+                    status_filtro = st.multiselect(
+                        "Filtrar por status",
+                        status_disponiveis,
+                        key="val_status",
                     )
+                    if status_filtro:
+                        divergentes = [
+                            d for d in divergentes if d.get("status") in status_filtro
+                        ]
 
-                    if st.button("Salvar e reprocessar", type="primary"):
-                        novos_campos = dict(campos_atuais)
-                        for k, v in editados.items():
-                            if v not in (None, ""):
-                                novos_campos[k] = v
+                    if not divergentes:
+                        st.info("Nenhuma remessa corresponde ao filtro.")
+                    else:
+                        opcoes = {
+                            f"{d.get('numero_remessa')} — "
+                            f"{d.get('status')} "
+                            f"(score {d.get('score')}, "
+                            f"NF {d.get('numero_nf')})": d
+                            for d in divergentes
+                        }
+                        escolha = st.selectbox(
+                            "Remessa", list(opcoes.keys()), key="sel_val"
+                        )
+                        d = opcoes[escolha]
 
-                        novo_json = _ler_json_bruto(item.get("campos_json"))
-                        novo_json["campos"] = novos_campos
-                        novo_json["confianca"] = nova_confianca
-                        novo_json["editado_manualmente"] = True
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric(
+                            "Valor da guia",
+                            f"R$ {d.get('valor_guia') or 0:.2f}",
+                        )
+                        c2.metric(
+                            "Reembolso cliente",
+                            f"R$ {d.get('valor_reembolso_cliente') or 0:.2f}",
+                        )
+                        c3.metric(
+                            "Esperado",
+                            f"R$ {d.get('valor_reembolso_esperado') or 0:.2f}",
+                        )
+                        c4.metric("Score", d.get("score") or 0)
 
-                        executar(
-                            "UPDATE fila_treinamento "
-                            "SET campos_json = ?, confianca = ?, "
-                            "tipo_documento = ?, numero_remessa = ?, "
-                            "resolvido = 1 WHERE id = ?",
-                            (
-                                json.dumps(novo_json, ensure_ascii=False),
-                                nova_confianca,
-                                novo_tipo,
-                                nova_remessa,
-                                item["id"],
-                            ),
+                        st.divider()
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.write("**Guia fiscal**")
+                            mostrar_documento(d.get("caminho_guia"), altura=380)
+                        with col2:
+                            st.write("**Comprovante Jadlog**")
+                            mostrar_documento(d.get("caminho_comp_jadlog"), altura=380)
+                        with col3:
+                            st.write("**Comprovante do cliente**")
+                            mostrar_documento(d.get("caminho_comp_cliente"), altura=380)
+
+                        st.divider()
+                        obs = st.text_area(
+                            "Observacao da validacao",
+                            key=f"obs_{d['id']}",
+                            placeholder="Motivo da aprovacao ou da manutencao...",
                         )
 
-                        st.success(
-                            f"Item #{item['id']} atualizado: tipo={novo_tipo}, "
-                            f"remessa={nova_remessa}, conf={nova_confianca}."
-                        )
+                        b1, b2, b3 = st.columns(3)
+                        if b1.button("Aprovar como conferido", type="primary"):
+                            executar(
+                                "UPDATE reembolsos SET "
+                                "status = 'CONFERIDO', "
+                                "data_atualizacao = datetime('now') "
+                                "WHERE id = ?",
+                                (d["id"],),
+                            )
+                            st.success(
+                                f"Remessa {d['numero_remessa']} aprovada "
+                                "como CONFERIDO."
+                            )
+                            if obs:
+                                st.caption(f"Obs: {obs}")
+                            st.cache_data.clear()
+                            st.rerun()
 
-                        if reprocessar_agora and nova_remessa:
+                        if b2.button("Marcar para revisao manual"):
+                            executar(
+                                "UPDATE reembolsos SET "
+                                "status = 'REVISAO_MANUAL', "
+                                "data_atualizacao = datetime('now') "
+                                "WHERE id = ?",
+                                (d["id"],),
+                            )
+                            st.info(
+                                f"Remessa {d['numero_remessa']} marcada para revisao."
+                            )
+                            st.cache_data.clear()
+                            st.rerun()
+
+                        if b3.button("Reprocessar esta remessa"):
                             try:
                                 from reprocessar import reprocessar_lote
 
-                                with st.spinner(f"Reprocessando {nova_remessa}..."):
-                                    ret = reprocessar_lote([nova_remessa])
+                                with st.spinner("Reprocessando..."):
+                                    ret = reprocessar_lote([d["numero_remessa"]])
                                 st.info(
-                                    f"Reprocessamento: "
-                                    f"{ret.get('processadas', 0)} processadas, "
+                                    f"{ret.get('processadas', 0)} "
+                                    f"processadas, "
                                     f"{ret.get('falhas', 0)} falhas."
                                 )
                                 for r in ret.get("resultados", []):
                                     st.write(
-                                        f"**{r['remessa']}** → {r['status']} "
+                                        f"**{r['remessa']}** → "
+                                        f"{r['status']} "
                                         f"(score {r.get('score')})"
                                     )
+                                st.cache_data.clear()
                             except Exception as e:
                                 st.warning(f"Reprocessamento falhou: {e}")
-
-                        st.cache_data.clear()
-                        st.rerun()
-
-        # ------------------------------------------------ LOTE
-        st.divider()
-        st.write("**Reprocessamento em lote**")
-        st.caption(
-            "Roda o OCR e a extracao em todos os itens pendentes. "
-            "Use o dry-run para ver o resultado antes de gravar."
-        )
-
-        col_lim, col_dry = st.columns(2)
-        limite_lote = col_lim.number_input(
-            "Limite de itens (0 = todos)",
-            min_value=0,
-            value=0,
-            key="reproc_limite",
-        )
-        dry_run = col_dry.checkbox(
-            "Dry-run (nao grava)",
-            value=True,
-            key="reproc_dry",
-        )
-
-        if st.button("Reprocessar fila", type="primary", key="btn_reproc_fila"):
-            try:
-                from reprocessar_fila import reprocessar
-
-                with st.spinner("Reprocessando a fila..."):
-                    ret = reprocessar(
-                        limite=int(limite_lote) or None,
-                        aplicar=not dry_run,
-                    )
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Processados", ret["total"])
-                c2.metric("Resolvidos", ret["resolvidos"])
-                c3.metric("Falhando", ret["falhando"])
-                c4.metric("Erros", ret["erros"])
-
-                if ret["aplicado"]:
-                    st.success("Campos gravados no banco.")
-                else:
-                    st.info("Dry-run: nada foi gravado.")
-
-                if ret.get("detalhes"):
-                    tabela = []
-                    for d in ret["detalhes"]:
-                        if d["status"] == "RESOLVIDO":
-                            marca = "🟢"
-                        elif d["status"] == "ERRO":
-                            marca = "⚫"
-                        else:
-                            marca = "🔴"
-                        tabela.append(
-                            {
-                                "Status": f"{marca} {d['status']}",
-                                "ID": d["id"],
-                                "Arquivo": d["arquivo"],
-                                "Tipo": d["tipo"],
-                                "Confianca": d["confianca"],
-                                "Faltando": ", ".join(d["faltando"]) or "-",
-                            }
-                        )
-                    st.dataframe(tabela, width="stretch", hide_index=True)
-
-                    with st.expander("Ver campos extraidos por item"):
-                        for d in ret["detalhes"]:
-                            st.write(f"**#{d['id']} — {d['arquivo']}** ({d['status']})")
-                            st.json(d["depois"])
-
-                st.cache_data.clear()
-
-                if ret["aplicado"]:
-                    st.rerun()
-
-            except Exception as e:
-                st.error(f"Falha no reprocessamento: {e}")
-
-    except Exception as e:
-        st.warning(f"Nao foi possivel carregar a fila: {e}")
+        except Exception as e:
+            st.warning(f"Nao foi possivel carregar a validacao: {e}")
 
 # ---- 8. layouts
 with abas[7]:
@@ -960,148 +1269,8 @@ with abas[7]:
     except Exception as e:
         st.warning(f"Nao foi possivel ler os layouts: {e}")
 
-# ---- 9. VALIDACAO
-with abas[8]:
-    st.subheader("Validacao de divergencias")
-    st.caption(
-        "Revise as remessas em divergencia, compare os documentos e decida: "
-        "aprovar como conferido ou manter a divergencia."
-    )
 
-    try:
-        if "reembolsos" not in tabelas_existentes():
-            st.info("Tabela reembolsos nao encontrada.")
-        else:
-            divergentes = consultar(
-                "SELECT * FROM reembolsos "
-                "WHERE status LIKE 'DIVERGENCIA%' "
-                "OR status = 'REVISAO_MANUAL' "
-                "OR status = 'AGUARDANDO_REEMBOLSO' "
-                "ORDER BY data_atualizacao DESC"
-            )
-
-            col_m1, col_m2, col_m3 = st.columns(3)
-            col_m1.metric("Em divergencia", len(divergentes))
-            col_m2.metric(
-                "Divergencia de valor",
-                len([d for d in divergentes if "VALOR" in (d.get("status") or "")]),
-            )
-            col_m3.metric(
-                "Divergencia de CNPJ",
-                len([d for d in divergentes if "CNPJ" in (d.get("status") or "")]),
-            )
-
-            if not divergentes:
-                st.success("Nenhuma remessa pendente de validacao.")
-            else:
-                st.divider()
-
-                # Filtro por status
-                status_disponiveis = sorted(
-                    {d.get("status") for d in divergentes if d.get("status")}
-                )
-                status_filtro = st.multiselect(
-                    "Filtrar por status",
-                    status_disponiveis,
-                    key="val_status",
-                )
-                if status_filtro:
-                    divergentes = [
-                        d for d in divergentes if d.get("status") in status_filtro
-                    ]
-
-                if not divergentes:
-                    st.info("Nenhuma remessa corresponde ao filtro.")
-                else:
-                    opcoes = {
-                        f"{d.get('numero_remessa')} — {d.get('status')} "
-                        f"(score {d.get('score')}, NF {d.get('numero_nf')})": d
-                        for d in divergentes
-                    }
-                    escolha = st.selectbox(
-                        "Remessa", list(opcoes.keys()), key="sel_val"
-                    )
-                    d = opcoes[escolha]
-
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Valor da guia", f"R$ {d.get('valor_guia') or 0:.2f}")
-                    c2.metric(
-                        "Reembolso cliente",
-                        f"R$ {d.get('valor_reembolso_cliente') or 0:.2f}",
-                    )
-                    c3.metric(
-                        "Esperado",
-                        f"R$ {d.get('valor_reembolso_esperado') or 0:.2f}",
-                    )
-                    c4.metric("Score", d.get("score") or 0)
-
-                    st.divider()
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.write("**Guia fiscal**")
-                        mostrar_documento(d.get("caminho_guia"), altura=380)
-                    with col2:
-                        st.write("**Comprovante Jadlog**")
-                        mostrar_documento(d.get("caminho_comp_jadlog"), altura=380)
-                    with col3:
-                        st.write("**Comprovante do cliente**")
-                        mostrar_documento(d.get("caminho_comp_cliente"), altura=380)
-
-                    st.divider()
-                    obs = st.text_area(
-                        "Observacao da validacao",
-                        key=f"obs_{d['id']}",
-                        placeholder="Motivo da aprovacao ou da manutencao...",
-                    )
-
-                    b1, b2, b3 = st.columns(3)
-                    if b1.button("Aprovar como conferido", type="primary"):
-                        executar(
-                            "UPDATE reembolsos SET status = 'CONFERIDO', "
-                            "data_atualizacao = datetime('now') WHERE id = ?",
-                            (d["id"],),
-                        )
-                        st.success(
-                            f"Remessa {d['numero_remessa']} aprovada como CONFERIDO."
-                        )
-                        if obs:
-                            st.caption(f"Obs: {obs}")
-                        st.cache_data.clear()
-                        st.rerun()
-
-                    if b2.button("Marcar para revisao manual"):
-                        executar(
-                            "UPDATE reembolsos SET status = 'REVISAO_MANUAL', "
-                            "data_atualizacao = datetime('now') WHERE id = ?",
-                            (d["id"],),
-                        )
-                        st.info(f"Remessa {d['numero_remessa']} marcada para revisao.")
-                        st.cache_data.clear()
-                        st.rerun()
-
-                    if b3.button("Reprocessar esta remessa"):
-                        try:
-                            from reprocessar import reprocessar_lote
-
-                            with st.spinner("Reprocessando..."):
-                                ret = reprocessar_lote([d["numero_remessa"]])
-                            st.info(
-                                f"{ret.get('processadas', 0)} processadas, "
-                                f"{ret.get('falhas', 0)} falhas."
-                            )
-                            for r in ret.get("resultados", []):
-                                st.write(
-                                    f"**{r['remessa']}** → {r['status']} "
-                                    f"(score {r.get('score')})"
-                                )
-                            st.cache_data.clear()
-                        except Exception as e:
-                            st.warning(f"Reprocessamento falhou: {e}")
-
-    except Exception as e:
-        st.warning(f"Nao foi possivel carregar a validacao: {e}")
-
-# ---- 10. reprocessar
+# ---- 09. reprocessar
 with abas[9]:
     st.subheader("Reprocessar remessas")
     try:
@@ -1133,7 +1302,7 @@ with abas[9]:
     except Exception as e:
         st.warning(f"Nao foi possivel reprocessar: {e}")
 
-# ---- 11. backup
+# ---- 10. backup
 with abas[10]:
     st.subheader("Backup do banco")
     motivo = st.text_input("Motivo", "manual")
@@ -1161,7 +1330,7 @@ with abas[10]:
     except Exception as e:
         st.warning(f"Nao foi possivel listar os backups: {e}")
 
-# ---- 12. reprocessar fila (aba nova)
+# ---- 11. reprocessar fila (aba nova)
 with abas[11]:
     st.subheader("Reprocessar a fila de treinamento")
     st.caption(
