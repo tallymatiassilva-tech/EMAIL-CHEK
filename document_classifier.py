@@ -1,6 +1,8 @@
 """Classificador de documentos por conteúdo (nunca pelo nome do arquivo).
 
 Ordem de decisão:
+0. Regras por conteúdo: DARE. Roda antes do cache porque o cache devolve
+   confiança baixa (~55%), abaixo do mínimo do pipeline para gravar layout.
 1. Cache de layout: se o formato já foi visto, o tipo vem do cache.
    Isso resolve os comprovantes de cliente, que têm dezenas de formatos
    (PIX do Nubank, TED do Itaú, transferência do Bradesco, etc.).
@@ -12,7 +14,6 @@ Ordem de decisão:
 
 A separação entre comprovante Jadlog e comprovante do cliente é feita pela
 DIREÇÃO do pagamento, não por palavras genéricas como "comprovante":
-
 - Comprovante Jadlog: a Jadlog PAGA o tributo. Ela aparece como cliente
   pagador e o governo/beneficiário recebe.
 - Comprovante Cliente: o cliente PAGA a Jadlog. A Jadlog aparece como
@@ -29,6 +30,7 @@ from log_manager import get_logger
 from ocr_engine import extrair_texto
 
 log = get_logger("classifier")
+
 
 # ---------------------------------------------------------------------------
 # SINAIS POR TIPO
@@ -143,10 +145,46 @@ SCORE_MINIMO = 25
 
 
 # ---------------------------------------------------------------------------
+# REGRAS POR CONTEUDO: DARE
+# ---------------------------------------------------------------------------
+def _regras_dare(texto: str) -> tuple[str, float] | None:
+    """Detecta a DARE (Documento de Arrecadacao de Receitas Estaduais).
+
+    Modelo nacional usado por RR e outros estados. Tem marcas textuais
+    inequivocas que nao aparecem em nenhuma outra guia.
+
+    Roda antes do cache de layout porque o cache devolve confianca baixa
+    (~55%), abaixo do CONFIANCA_MINIMA_LAYOUT do pipeline, e o layout da
+    DARE nunca seria gravado.
+
+    Retorna (tipo, confianca) ou None quando nao e DARE.
+    """
+    up = texto.upper()
+
+    # Marcas fortes: o titulo do documento
+    if "DOCUMENTO DE ARRECADA" in up and "RECEITAS ESTADUAIS" in up:
+        return TipoDoc.GUIA, 95.0
+
+    # Marca do formulario impresso
+    if "PR_IMPDA" in up:
+        return TipoDoc.GUIA, 90.0
+
+    # Combinacao de rotulos exclusivos da DARE
+    marcadores = [
+        "AUTENTICA" in up and "MEC" in up,
+        "CONTRIBUINTE EVENTUAL" in up,
+        "SEQ" in up and "FRONTEIRA" in up,
+        "AÇÃO FISCAL" in up or "ACAO FISCAL" in up,
+    ]
+    if sum(marcadores) >= 2:
+        return TipoDoc.GUIA, 85.0
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # DETECÇÃO DE DIREÇÃO DO PAGAMENTO
 # ---------------------------------------------------------------------------
-
-
 def _extrair_bloco(texto: str, marcador: str, tamanho: int = 400) -> str:
     """Retorna o trecho do texto que vem depois de um marcador."""
     idx = texto.find(marcador)
@@ -194,8 +232,6 @@ def _detectar_direcao(texto: str) -> str | None:
 # ---------------------------------------------------------------------------
 # SCORE
 # ---------------------------------------------------------------------------
-
-
 def _pontuar(texto: str, sinais: dict[str, int]) -> tuple[int, list[str]]:
     """Soma os pesos dos sinais encontrados. Retorna (score, sinais_detectados)."""
     up = texto.upper()
@@ -226,8 +262,6 @@ def _e_guia(score_guia: int, sinais_anti_guia: int) -> bool:
 # ---------------------------------------------------------------------------
 # CLASSIFICAÇÃO
 # ---------------------------------------------------------------------------
-
-
 def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
     """Retorna (tipo, confianca 0-100)."""
     caminho = Path(caminho)
@@ -247,8 +281,25 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
 
     if texto is None:
         texto = extrair_texto(caminho)
+
     if not texto or len(texto.strip()) < 20:
         return TipoDoc.DESCONHECIDO, 0.0
+
+    # ------------------------------------------------------------------
+    # 0) REGRAS POR CONTEUDO: DARE.
+    # Roda antes do cache porque o cache devolve confianca baixa (~55%),
+    # abaixo do minimo do pipeline para gravar o layout aprendido.
+    # ------------------------------------------------------------------
+    regra_dare = _regras_dare(texto)
+    if regra_dare:
+        tipo_dare, conf_dare = regra_dare
+        log.info(
+            "%s -> %s (%.1f%%) por regra DARE",
+            caminho.name,
+            tipo_dare,
+            conf_dare,
+        )
+        return tipo_dare, conf_dare
 
     # ------------------------------------------------------------------
     # 1) CACHE DE LAYOUT: formato já visto decide o tipo.
@@ -291,6 +342,7 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
     # Só roda depois que a guia foi descartada.
     # ------------------------------------------------------------------
     direcao = _detectar_direcao(texto)
+
     if direcao == "JADLOG":
         score, sinais = _pontuar(texto, SINAIS_COMP_JADLOG)
         confianca = min(100.0, 60.0 + score * 0.3)
@@ -324,8 +376,8 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
         TipoDoc.COMP_JADLOG: score_jadlog,
         TipoDoc.COMP_CLIENTE: score_cliente,
     }
-
     melhor = max(scores, key=scores.get)
+
     if scores[melhor] < SCORE_MINIMO:
         log.info(
             "%s -> DESCONHECIDO (score abaixo do mínimo: %d)",
@@ -336,7 +388,6 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
 
     total = sum(scores.values()) or 1
     confianca = round((scores[melhor] / total) * 100, 1)
-
     sinais_por_tipo = {
         TipoDoc.COMP_JADLOG: sinais_jadlog,
         TipoDoc.COMP_CLIENTE: sinais_cliente,
@@ -348,5 +399,4 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
         confianca,
         sinais_por_tipo[melhor],
     )
-
     return melhor, confianca

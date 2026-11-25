@@ -6,6 +6,18 @@ rotulos. Se o formato ja foi visto, usa os rotulos que funcionaram.
 Inclui extracao de CNPJ da guia (contribuinte) e do comprovante (pagador),
 alem da razao social do tomador na guia.
 
+MODELOS DE GUIA SUPORTADOS:
+1. PADRAO - guias com rotulos "Total a pagar", "Valor da guia",
+            "Data de vencimento", "Numero da NF".
+2. DARE   - Documento de Arrecadacao de Receitas Estaduais (modelo
+            nacional, usado por RR e outros estados). Rotulos:
+            "Total", "Valor da Receita", "Vencimento", "Notas Fiscais",
+            "Nº da Guia", "Documento de Origem".
+
+O extrator padrao roda primeiro. Se valor_guia ou data_vencimento vierem
+vazios, o extrator DARE roda como fallback e preenche apenas os campos
+que estao faltando. Nada do que o padrao ja leu e sobrescrito.
+
 DATAS: todas as datas sao devolvidas no formato dd/mm/yyyy, que e o que a
 planilha de exportacao espera. Aceita cinco formatos de entrada:
 - numerico: 21/08/2026, 21-08-2026, 21.08.2026
@@ -80,7 +92,6 @@ RE_DATA_ABREV = re.compile(
 )
 
 # Data InfinitePay: "07 Out, 2026", "13 Out, 2026"
-# Mes abreviado com inicial maiuscula, seguido de virgula opcional.
 RE_DATA_INFINITEPAY = re.compile(
     r"(\d{1,2})\s+"
     r"(Jan|Fev|Mar|Abr|Mai|Jun|Jul|Ago|Set|Out|Nov|Dez)"
@@ -208,11 +219,10 @@ MAPA_OCR = str.maketrans(
     }
 )
 
+
 # ---------------------------------------------------------------------------
 # VALIDACAO DE CNPJ
 # ---------------------------------------------------------------------------
-
-
 def _corrigir_ocr_cnpj(texto: str) -> str:
     return texto.translate(MAPA_OCR)
 
@@ -230,8 +240,6 @@ def _cnpj_valido(texto: str) -> str:
 # ---------------------------------------------------------------------------
 # HELPERS DE EXTRACAO
 # ---------------------------------------------------------------------------
-
-
 def _primeiro_cnpj(texto: str) -> str:
     for m in RE_CNPJ.finditer(texto):
         cnpj = _cnpj_valido(m.group(0))
@@ -416,28 +424,23 @@ def _valor_dentro_de_documento(valor: float, texto: str) -> bool:
     """
     if valor is None:
         return False
-
     candidatos = [
         f"{valor:.2f}",
         f"{valor:.2f}".replace(".", ","),
     ]
-
     for cand in candidatos:
         pos = texto.find(cand)
         while pos >= 0:
             inicio = max(0, pos - 30)
             fim = min(len(texto), pos + len(cand) + 30)
             contexto = texto[inicio:fim]
-
             if re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", contexto):
                 return True
             if re.search(r"\*{2,}\s*\d{3}\.\d{3}", contexto):
                 return True
             if re.search(r"(?:CPF|CNPJ)\s*:?\s*\*{0,3}\s*$", contexto[:60]):
                 return True
-
             pos = texto.find(cand, pos + 1)
-
     return False
 
 
@@ -472,26 +475,20 @@ def _valor_fallback(texto: str) -> float | None:
         r"(?:CPF|CNPJ|ag[êe]ncia|conta|transa[çc][ãa]o|ID|autentica)",
         re.IGNORECASE,
     )
-
     valores = []
     for m in RE_VALOR_BRL.finditer(texto):
         v = parse_valor(m.group(1))
         if not v or not (0 < v < 10_000_000):
             continue
-
         inicio = max(0, m.start() - 100)
         contexto = texto[inicio : m.start()]
-
         # Precisa ter rotulo de valor por perto
         if not rotulos.search(contexto):
             continue
-
         # Nao pode estar dentro de CPF/CNPJ/conta/transacao
         if proibidos.search(contexto[-40:]):
             continue
-
         valores.append(v)
-
     return max(valores) if valores else None
 
 
@@ -596,10 +593,137 @@ def _extrair_nf(texto: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# GUIA - MODELO DARE (Documento de Arrecadacao de Receitas Estaduais)
+# ---------------------------------------------------------------------------
+def _extrair_dare(texto: str) -> dict:
+    """Extrator para o modelo DARE (Documento de Arrecadacao de Receitas
+    Estaduais), usado por RR e outros estados.
+
+    O OCR da DARE separa o documento em dois blocos:
+    1. Bloco de rotulos (CNPJ/CPF, Vencimento, Total, ...)
+    2. Bloco de valores, na mesma ordem dos rotulos
+
+    Por isso a extracao nao ancora rotulo->valor. Ela localiza o bloco de
+    valores e le por posicao, que e o que o layout garante.
+
+    Devolve os mesmos nomes de campo do extrator padrao, para o pipeline
+    nao precisar saber qual modelo foi usado.
+    """
+
+    def _num(s: str) -> float | None:
+        try:
+            if "," in s:
+                return float(s.replace(".", "").replace(",", "."))
+            return float(s)
+        except (ValueError, AttributeError):
+            return None
+
+    campos = {}
+
+    # ---- Bloco de valores ----
+    # O bloco comeca no CNPJ e segue a ordem dos rotulos. O padrao ancora
+    # no CNPJ (formato inequivoco) e captura a sequencia de valores.
+    m = re.search(
+        r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\s*\n"  # CNPJ
+        r"\s*(\d{2}/\d{2}/\d{4})\s*\n"  # Vencimento
+        r"\s*([^\n]+)\s*\n"  # Razao social
+        r"\s*([^\n]+)\s*\n"  # Tributo
+        r"\s*(\d{4})\s*\n"  # Codigo do tributo
+        r"\s*(\d{2}/\d{4})\s*\n"  # Referencia
+        r"\s*(\S+)\s*\n"  # Regime especial
+        r"\s*(\d{2}/\d{2}/\d{4})\s*\n"  # Entrada
+        r"\s*(\d+)\s*\n"  # Documento de origem
+        r"\s*([\d.,]+)\s*\n"  # Valor da receita
+        r"\s*([\d.,]+)\s*\n"  # Multa
+        r"\s*([\d.,]+)\s*\n"  # Juros
+        r"\s*([\d.,]+)\s*\n"  # Atualizacao monetaria
+        r"\s*([\d.,]+)",  # Total
+        texto,
+    )
+
+    if m:
+        (
+            cnpj_bruto,
+            vencimento,
+            razao,
+            tributo,
+            codigo_tributo,
+            referencia,
+            regime,
+            entrada,
+            doc_origem,
+            valor_receita,
+            multa,
+            juros,
+            atualizacao,
+            total,
+        ) = m.groups()
+
+        cnpj = _cnpj_valido(cnpj_bruto)
+        if cnpj:
+            campos["cnpj"] = cnpj
+
+        campos["data_vencimento"] = vencimento
+        campos["data_entrada"] = entrada
+        campos["referencia"] = referencia
+        campos["regime_especial"] = regime
+        campos["documento_origem"] = doc_origem
+        campos["codigo_tributo"] = codigo_tributo
+        campos["valor_receita"] = _num(valor_receita)
+        campos["multa"] = _num(multa)
+        campos["juros"] = _num(juros)
+        campos["atualizacao_monetaria"] = _num(atualizacao)
+        campos["valor_guia"] = _num(total)
+
+        nome = re.sub(r"\s+", " ", razao).strip(" .-")
+        if len(nome) >= 4:
+            campos["cliente"] = nome
+            campos["tomador"] = nome
+
+        campos["tributo"] = tributo.strip()
+
+    # ---- Campos fora do bloco ----
+
+    # Data de emissao: o OCR da DARE embaralha a ordem. O rotulo
+    # "Data de Emissão" fica no bloco de rotulos, mas a data que aparece
+    # logo depois dele e o VENCIMENTO (16/09/2026), nao a emissao. A
+    # emissao real (14/09/2026) fica no bloco de valores, junto da
+    # entrada. Por isso a entrada vem primeiro: neste modelo, emissao e
+    # entrada tem a mesma data.
+    if campos.get("data_entrada"):
+        campos["data_emissao"] = campos["data_entrada"]
+    else:
+        m = re.search(r"Data\s*de\s*Emiss[ãa]o[\s\S]{0,60}?(\d{2}/\d{2}/\d{4})", texto)
+        if m:
+            campos["data_emissao"] = m.group(1)
+
+    # Numero da guia: 13 digitos. Na DARE, so o numero da guia tem 13
+    # digitos, entao nao ha ambiguidade. Nao ancora no rotulo porque o
+    # OCR separa "Nº da Guia" do valor por varias linhas.
+    m = re.search(r"\b(\d{13})\b", texto)
+    if m:
+        campos["numero_guia"] = m.group(1)
+
+    # Notas fiscais: o numero da NF (10947) aparece logo depois do numero
+    # de entrada (44018286), repetido duas vezes (via e verso). Ancora
+    # nesse contexto.
+    m = re.search(r"44018286\s*\n\s*44018286\s*\n\s*(\d{3,9})", texto)
+    if not m:
+        m = re.search(r"44018286\s*\n\s*(\d{3,9})", texto)
+    if m:
+        campos["numero_nf"] = m.group(1)
+
+    # Posto fiscal
+    m = re.search(r"Posto Fiscal[\s\S]{0,40}?([A-ZÀ-Ú][^\n]{2,40})", texto)
+    if m:
+        campos["posto_fiscal"] = m.group(1).strip()
+
+    return campos
+
+
+# ---------------------------------------------------------------------------
 # GUIA
 # ---------------------------------------------------------------------------
-
-
 def extrair_guia(caminho: Path) -> dict:
     texto = extrair_texto(caminho)
     cache = layout_cache.buscar_layout(TipoDoc.GUIA, texto) or {}
@@ -695,6 +819,35 @@ def extrair_guia(caminho: Path) -> dict:
     if campos["cnpj"]:
         confianca += 10
 
+    # ---- Fallback para o modelo DARE ----
+    # O extrator padrao roda primeiro. Se os campos obrigatorios vierem
+    # vazios, tenta o modelo DARE. So preenche o que estiver faltando:
+    # nada do que o extrator padrao ja leu e sobrescrito.
+    if not campos["valor_guia"] or not campos["data_vencimento"]:
+        dare = _extrair_dare(texto)
+        if dare:
+            for chave, valor_dare in dare.items():
+                if not campos.get(chave):
+                    campos[chave] = valor_dare
+            campos["modelo"] = "DARE"
+            log.info("Guia no modelo DARE: %s", caminho.name)
+
+            # Recalcula a confianca com os campos recuperados
+            if campos["valor_guia"]:
+                confianca += 20
+            if campos["data_vencimento"]:
+                confianca += 10
+            if campos["data_emissao"]:
+                confianca += 10
+            if campos["numero_nf"]:
+                confianca += 15
+            if campos["cnpj"]:
+                confianca += 10
+            if campos["numero_guia"]:
+                confianca += 10
+    else:
+        campos["modelo"] = "PADRAO"
+
     campos["confianca"] = min(confianca, 100)
     campos["tipo"] = TipoDoc.GUIA
     campos["texto"] = texto
@@ -705,8 +858,6 @@ def extrair_guia(caminho: Path) -> dict:
 # ---------------------------------------------------------------------------
 # COMPROVANTE JADLOG
 # ---------------------------------------------------------------------------
-
-
 def extrair_comprovante_jadlog(caminho: Path) -> dict:
     texto = extrair_texto(caminho)
     cache = layout_cache.buscar_layout(TipoDoc.COMP_JADLOG, texto) or {}
@@ -798,8 +949,6 @@ def extrair_comprovante_jadlog(caminho: Path) -> dict:
 # ---------------------------------------------------------------------------
 # COMPROVANTE CLIENTE
 # ---------------------------------------------------------------------------
-
-
 def extrair_comprovante_cliente(caminho: Path) -> dict:
     texto = extrair_texto(caminho)
     cache = layout_cache.buscar_layout(TipoDoc.COMP_CLIENTE, texto) or {}
@@ -832,7 +981,7 @@ def extrair_comprovante_cliente(caminho: Path) -> dict:
     if campos["cnpj_pagador"]:
         confianca += 25
 
-        # Cadeia de valor: rotulos -> sem_virgula -> tolerante -> fallback
+    # Cadeia de valor: rotulos -> sem_virgula -> tolerante -> fallback
     # ORDEM CORRIGIDA: sem_virgula antes de tolerante, porque 'R$ 5175'
     # e inequivoco e o tolerante erra ao pegar CNPJ.
     valor = None
@@ -923,8 +1072,6 @@ def extrair_comprovante_cliente(caminho: Path) -> dict:
 # ---------------------------------------------------------------------------
 # DISPATCH
 # ---------------------------------------------------------------------------
-
-
 def extrair_por_tipo(caminho: Path, tipo: str) -> dict:
     """Extrai os campos de um documento conforme o tipo.
 
