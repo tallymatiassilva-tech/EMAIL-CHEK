@@ -7,17 +7,24 @@ Inclui extracao de CNPJ da guia (contribuinte) e do comprovante (pagador),
 alem da razao social do tomador na guia.
 
 DATAS: todas as datas sao devolvidas no formato dd/mm/yyyy, que e o que a
-planilha de exportacao espera. Aceita quatro formatos de entrada:
+planilha de exportacao espera. Aceita cinco formatos de entrada:
 - numerico: 21/08/2026, 21-08-2026, 21.08.2026
 - por extenso: 21/agosto/2026, 9/setembro/2026 (comprovante Mercado Pago)
 - abreviado: 23 OUT 2026, 15 SET 2026 (comprovante Nubank)
+- InfinitePay: 07 Out, 2026 (comprovante InfinitePay)
 - ISO: 2026-08-21
+
+VALORES: a cadeia de extracao tenta, nesta ordem:
+1. rotulos especificos do tipo de documento
+2. rotulos genericos (valor, total, pago)
+3. valor_tolerante (heuristica por proximidade)
+4. _valor_sem_virgula (OCR removeu a virgula: "R$ 5175" -> 51.75)
+5. _valor_fallback (ultimo recurso, rejeita CPF/CNPJ)
 
 CONTRATO COM O PIPELINE:
 Cada extrator devolve, alem dos campos de negocio, duas chaves internas:
 - `_rotulos`: mapa campo -> rotulo que funcionou na extracao.
 - `texto`: o texto bruto extraido, usado pelo hash do layout.
-
 A gravacao do layout NAO acontece aqui. Quem decide gravar e o pipeline.
 """
 
@@ -38,7 +45,21 @@ RE_NF_SECAO = re.compile(
     r"notas?\s*fiscais?[^\n]*\n(.{0,400})", re.IGNORECASE | re.DOTALL
 )
 RE_NF = re.compile(r"\b(\d{3,9})\b")
-RE_VALOR_BRL = re.compile(r"R?\$?\s*(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})")
+
+# VALOR: aceita quatro formatos.
+# - 1.234,56  -> milhar com ponto, decimal com virgula (BR)
+# - 1,234.56  -> milhar com virgula, decimal com ponto (US)
+# - 265.44    -> decimal simples com ponto (comprovante Olist/Celcoin)
+# - 265,44    -> decimal simples com virgula (BR)
+RE_VALOR_BRL = re.compile(
+    r"R?\$?\s*("
+    r"\d{1,3}(?:\.\d{3})*,\d{2}"
+    r"|\d{1,3}(?:,\d{3})*\.\d{2}"
+    r"|\d+\.\d{2}"
+    r"|\d+,\d{2}"
+    r")"
+)
+
 RE_DATA_BR = re.compile(r"(\d{1,2}[/.-]\d{1,2}[/.-]\d{4})")
 
 # Data com mes por extenso: "21/agosto/2026", "9/setembro/2026"
@@ -55,6 +76,15 @@ RE_DATA_ABREV = re.compile(
     r"(\d{1,2})\s+"
     r"(JAN|FEV|MAR|ABR|MAI|JUN|JUL|AGO|SET|OUT|NOV|DEZ)"
     r"\s+(\d{4})",
+    re.IGNORECASE,
+)
+
+# Data InfinitePay: "07 Out, 2026", "13 Out, 2026"
+# Mes abreviado com inicial maiuscula, seguido de virgula opcional.
+RE_DATA_INFINITEPAY = re.compile(
+    r"(\d{1,2})\s+"
+    r"(Jan|Fev|Mar|Abr|Mai|Jun|Jul|Ago|Set|Out|Nov|Dez)"
+    r"\s*,?\s*(\d{4})",
     re.IGNORECASE,
 )
 
@@ -142,7 +172,7 @@ ROTULOS_CNPJ_GUIA = [
     r"contribuinte\s*[:.]?\s*(?:cnpj|cpf)",
     r"inscri[çc][ãa]o\s*(?:estadual|no\s*estado)",
     r"cnpj\s*[:.]?\s*",
-    r"cpf\s*/?\s*cnpj",
+    r"cpf\s*/?cnpj",
     r"raz[ãa]o\s*social",
     r"nome\s*(?:do\s*)?(?:contribuinte|destinat[aá]rio|tomador)",
 ]
@@ -177,7 +207,6 @@ MAPA_OCR = str.maketrans(
         "G": "6",
     }
 )
-
 
 # ---------------------------------------------------------------------------
 # VALIDACAO DE CNPJ
@@ -302,10 +331,11 @@ def _valor_apos_rotulo(texto: str, rotulos: list[str]) -> tuple[float | None, st
 def _data_apos_rotulo(texto: str, rotulos: list[str]) -> tuple[str | None, str]:
     """Retorna (data em dd/mm/yyyy, rotulo que casou).
 
-    Aceita tres formatos:
+    Aceita quatro formatos:
     - numerico: 21/08/2026, 21-08-2026, 21.08.2026
     - por extenso: 21/agosto/2026, 9/setembro/2026 (Mercado Pago)
     - abreviado: 23 OUT 2026, 15 SET 2026 (Nubank)
+    - InfinitePay: 07 Out, 2026
 
     Sempre devolve no formato dd/mm/yyyy, que e o que a planilha espera.
     """
@@ -314,7 +344,6 @@ def _data_apos_rotulo(texto: str, rotulos: list[str]) -> tuple[str | None, str]:
         m_janela = re.search(padrao_janela, texto, re.IGNORECASE)
         if not m_janela:
             continue
-
         trecho = texto[m_janela.start() : m_janela.end() + 60]
 
         # 1) Mes por extenso: 21/agosto/2026
@@ -334,7 +363,15 @@ def _data_apos_rotulo(texto: str, rotulos: list[str]) -> tuple[str | None, str]:
                 dia, mes, ano = partes
                 return f"{int(dia):02d}/{int(mes):02d}/{ano}", rotulo
 
-        # 3) Mes abreviado: 23 OUT 2026
+        # 3) InfinitePay: 07 Out, 2026
+        m_inf = RE_DATA_INFINITEPAY.search(trecho)
+        if m_inf:
+            dia, mes_abrev, ano = m_inf.groups()
+            mes_num = MESES_ABREV.get(mes_abrev.upper())
+            if mes_num:
+                return f"{int(dia):02d}/{mes_num:02d}/{ano}", rotulo
+
+        # 4) Mes abreviado: 23 OUT 2026
         m_abrev = RE_DATA_ABREV.search(trecho)
         if m_abrev:
             dia, mes_abrev, ano = m_abrev.groups()
@@ -345,12 +382,116 @@ def _data_apos_rotulo(texto: str, rotulos: list[str]) -> tuple[str | None, str]:
     return None, ""
 
 
+def _valor_sem_virgula(texto: str) -> float | None:
+    """Recupera valor quando o OCR removeu a virgula decimal.
+
+    O comprovante Mercado Pago as vezes sai como 'R$ 5175' em vez de
+    'R$ 51,75'. Os dois ultimos digitos sao sempre os centavos.
+
+    Exemplos reais:
+    - "R$ 5175"  -> 51.75
+    - "R$ 61323" -> 613.23
+    - "R$ 11223" -> 112.23
+    - "R$ 24554" -> 245.54
+
+    Retorna None quando o valor esta corrompido com simbolos
+    ("R$ 38ºº", "R$ 352?º"), porque nesse caso nao ha como recuperar.
+    """
+    for m in re.finditer(r"R\$\s*(\d{4,7})\b", texto):
+        bruto = m.group(1)
+        try:
+            valor = float(bruto[:-2] + "." + bruto[-2:])
+        except ValueError:
+            continue
+        if 0 < valor < 10_000_000:
+            return valor
+    return None
+
+
+def _valor_dentro_de_documento(valor: float, texto: str) -> bool:
+    """Verifica se o valor extraido na verdade e parte de um CNPJ ou CPF.
+
+    O OCR frequentemente le '37.242.743/0001-88' e a regex de valor casa
+    '37.24' no inicio. Este filtro rejeita esse caso.
+    """
+    if valor is None:
+        return False
+
+    candidatos = [
+        f"{valor:.2f}",
+        f"{valor:.2f}".replace(".", ","),
+    ]
+
+    for cand in candidatos:
+        pos = texto.find(cand)
+        while pos >= 0:
+            inicio = max(0, pos - 30)
+            fim = min(len(texto), pos + len(cand) + 30)
+            contexto = texto[inicio:fim]
+
+            if re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", contexto):
+                return True
+            if re.search(r"\*{2,}\s*\d{3}\.\d{3}", contexto):
+                return True
+            if re.search(r"(?:CPF|CNPJ)\s*:?\s*\*{0,3}\s*$", contexto[:60]):
+                return True
+
+            pos = texto.find(cand, pos + 1)
+
+    return False
+
+
+def _valor_corrompido_no_texto(texto: str) -> bool:
+    """Detecta quando o valor real esta ilegivel no OCR.
+
+    Casos reais:
+    - 'R$ 38ºº'    -> simbolos no lugar dos digitos
+    - 'R$ 352?º'   -> interrogacao e ordinal
+    - 'R$ 38:3º'   -> dois pontos e ordinal
+    - 'R$ 100"'    -> aspas no lugar dos centavos
+    """
+    padrao = re.compile(r"R\$\s*[\d]*[º°?\"”'`:;][\dº°?\"”'`:;]*")
+    return bool(padrao.search(texto))
+
+
 def _valor_fallback(texto: str) -> float | None:
+    """Maior valor plausivel do texto, exigindo contexto de valor.
+
+    Diferente da versao antiga, nao aceita qualquer numero solto:
+    - precisa estar a ate 100 caracteres de um rotulo de valor
+    - nao pode estar dentro de CPF, CNPJ, ID de transacao ou conta
+
+    Isso evita que o fallback invente valores a partir de CPF, CNPJ ou
+    numero de transacao quando o OCR corrompe o valor real.
+    """
+    rotulos = re.compile(
+        r"(?:valor|total|pago|pagar|R\$|reais)",
+        re.IGNORECASE,
+    )
+    proibidos = re.compile(
+        r"(?:CPF|CNPJ|ag[êe]ncia|conta|transa[çc][ãa]o|ID|autentica)",
+        re.IGNORECASE,
+    )
+
     valores = []
     for m in RE_VALOR_BRL.finditer(texto):
         v = parse_valor(m.group(1))
-        if v and 0 < v < 10_000_000:
-            valores.append(v)
+        if not v or not (0 < v < 10_000_000):
+            continue
+
+        inicio = max(0, m.start() - 100)
+        contexto = texto[inicio : m.start()]
+
+        # Precisa ter rotulo de valor por perto
+        if not rotulos.search(contexto):
+            continue
+
+        # Nao pode estar dentro de CPF/CNPJ/conta/transacao
+        if proibidos.search(contexto[-40:]):
+            continue
+
+        valores.append(v)
+
     return max(valores) if valores else None
 
 
@@ -360,8 +501,9 @@ def _data_fallback(texto: str) -> str | None:
     Ordem de tentativa:
     1. Mes por extenso: 21/agosto/2026 (comprovante Mercado Pago)
     2. Numerico brasileiro: 21/08/2026, 21-08-2026, 21.08.2026
-    3. Mes abreviado: 23 OUT 2026 (comprovante Nubank)
-    4. ISO: 2026-08-21
+    3. InfinitePay: 07 Out, 2026
+    4. Mes abreviado: 23 OUT 2026 (comprovante Nubank)
+    5. ISO: 2026-08-21
 
     Sempre devolve dd/mm/yyyy, que e o formato da planilha.
     """
@@ -382,7 +524,15 @@ def _data_fallback(texto: str) -> str | None:
             if 2000 <= int(ano) <= 2100:
                 return f"{int(dia):02d}/{int(mes):02d}/{ano}"
 
-    # 3) Mes abreviado: 23 OUT 2026
+    # 3) InfinitePay: 07 Out, 2026
+    m = RE_DATA_INFINITEPAY.search(texto)
+    if m:
+        dia, mes_abrev, ano = m.groups()
+        mes_num = MESES_ABREV.get(mes_abrev.upper())
+        if mes_num:
+            return f"{int(dia):02d}/{mes_num:02d}/{ano}"
+
+    # 4) Mes abreviado: 23 OUT 2026
     m = RE_DATA_ABREV.search(texto)
     if m:
         dia, mes_abrev, ano = m.groups()
@@ -390,7 +540,7 @@ def _data_fallback(texto: str) -> str | None:
         if mes_num:
             return f"{int(dia):02d}/{mes_num:02d}/{ano}"
 
-    # 4) ISO (YYYY-MM-DD)
+    # 5) ISO (YYYY-MM-DD)
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", texto)
     if m:
         ano, mes, dia = m.groups()
@@ -682,15 +832,41 @@ def extrair_comprovante_cliente(caminho: Path) -> dict:
     if campos["cnpj_pagador"]:
         confianca += 25
 
+        # Cadeia de valor: rotulos -> sem_virgula -> tolerante -> fallback
+    # ORDEM CORRIGIDA: sem_virgula antes de tolerante, porque 'R$ 5175'
+    # e inequivoco e o tolerante erra ao pegar CNPJ.
+    valor = None
+    rotulo = ""
+
+    # 1) Rotulos especificos
     valor, rotulo = _valor_com_cache(
         texto, [r"valor\s*pago", r"valor"], cache.get("valor_reembolso")
     )
+
+    # 2) Se o valor veio de um CNPJ/CPF, descarta
+    if valor and _valor_dentro_de_documento(valor, texto):
+        log.debug("valor %s descartado: pertence a CNPJ/CPF no texto", valor)
+        valor = None
+        rotulo = ""
+
+    # 3) Valor sem virgula (OCR removeu a virgula decimal)
+    if not valor:
+        valor = _valor_sem_virgula(texto)
+        rotulo = "sem_virgula"
+
+    # 4) Tolerante (heuristica por proximidade)
     if not valor:
         valor = valor_tolerante(texto, caminho)
         rotulo = "tolerante"
+
+    # 5) Fallback (ultimo recurso, ja rejeita CPF/CNPJ)
     if not valor:
         valor = _valor_fallback(texto)
         rotulo = "fallback"
+
+    # 6) Valor corrompido e irrecuperavel: deixa None para revisao manual
+    if not valor and _valor_corrompido_no_texto(texto):
+        log.info("valor corrompido no OCR e nao recuperavel: %s", caminho.name)
 
     campos["valor_reembolso"] = valor
     if valor:

@@ -1,0 +1,176 @@
+==============================================================================
+  COMPROVANTES PARA REVISAO MANUAL
+==============================================================================
+
+Total: 22 item(ns)
+Preencha 'Valor Revisado' e 'Data Revisada' no CSV.
+Depois rode: python importar_revisao.py --aplicar
+
+------------------------------------------------------------------------------
+REMESSA 10085065851740 (5 item(ns))
+------------------------------------------------------------------------------
+
+  ID 3  |  WhatsApp Image 2026-09-09 at 10.50.42.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 09/09/2026
+  Trecho: cado | pago | & Comprovante de Pix | 9/setembro/2026 às 10:49:42. | R$ 38ºº | Origem e destino | <& MODA PREMIUM LINGERIE CONCHAS LTDA .. | Mercado Pago | CNPJ: 37.242.743/0001-88 | p | J
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\10085065851740\WhatsApp Image 2026-09-09 at 10.50.42.jpeg
+
+  ID 4  |  WhatsApp Image 2026-09-09 at 10.50.42_1.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 09/09/2026
+  Trecho: cado | pago | & Comprovante de Pix | 9/setembro/2026 às 10:49:42. | R$ 38ºº | Origem e destino | <& MODA PREMIUM LINGERIE CONCHAS LTDA .. | Mercado Pago | CNPJ: 37.242.743/0001-88 | p | J
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\10085065851740\WhatsApp Image 2026-09-09 at 10.50.42_1.jpeg
+
+  ID 37  |  WhatsApp Image 2026-09-09 at 10.50.42.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 09/09/2026
+  Trecho: cado | pago | & Comprovante de Pix | 9/setembro/2026 às 10:49:42. | R$ 38ºº | Origem e destino | <& MODA PREMIUM LINGERIE CONCHAS LTDA .. | Mercado Pago | CNPJ: 37.242.743/0001-88 | p | J
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\10085065851740\WhatsApp Image 2026-09-09 at 10.50.42.jpeg
+
+  ID 64  |  WhatsApp Image 2026-09-09 at 10.50.42.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 09/09/2026
+  Trecho: cado | pago | & Comprovante de Pix | 9/setembro/2026 às 10:49:42. | R$ 38ºº | Origem e destino | <& MODA PREMIUM LINGERIE CONCHAS LTDA .. | Mercado Pago | CNPJ: 37.242.743/0001-88 | p | J
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\10085065851740\WhatsApp Image 2026-09-09 at 10.50.42.jpeg
+
+  ID 65  |  WhatsApp Image 2026-09-09 at 10.50.42_1.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 09/09/2026
+  Trecho: cado | pago | & Comprovante de Pix | 9/setembro/2026 às 10:49:42. | R$ 38ºº | Origem e destino | <& MODA PREMIUM LINGERIE CONCHAS LTDA .. | Mercado Pago | CNPJ: 37.242.743/0001-88 | p | J
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\10085065851740\WhatsApp Image 2026-09-09 at 10.50.42_1.jpeg
+
+------------------------------------------------------------------------------
+REMESSA 18131502322673 (2 item(ns))
+------------------------------------------------------------------------------
+
+  ID 39  |  unnamed.png
+  Motivo: data ausente / valor legivel no texto
+  Valor atual: 543.0
+  Trecho: pags * | pago | O Comprovante de Pix | Fiotubeor2026 ds 16:35:37. | R$ 65% | Orgem e destro | O COMERCIAL VEZATTO STORELTOA .- | Mercado Pago | , CMP X 20 749 543,0001-25 | a Sediogto
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18131502322673\unnamed.png
+
+  ID 40  |  unnamed_1.png
+  Motivo: data ausente / valor legivel no texto
+  Valor atual: 543.0
+  Trecho: pags * | pago | O Comprovante de Pix | Fiotubeor2026 ds 16:35:37. | R$ 65% | Orgem e destro | O COMERCIAL VEZATTO STORELTOA .- | Mercado Pago | , CMP X 20 749 543,0001-25 | a Sediogto
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18131502322673\unnamed_1.png
+
+------------------------------------------------------------------------------
+REMESSA 18167701149327 (5 item(ns))
+------------------------------------------------------------------------------
+
+  ID 9  |  compro.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 21/08/2026
+  Trecho: rcado | pago | & Comprovante de Pix | 21/agosto/2026 às 12:34:40. | R$ 13º? | Origem e destino | & VIACOTTONINDUSTRIA DE MALHAS E | LENCOISLTDA .- | Mercado Pago | CNPJ: 28.338.300/0001
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701149327\compro.jpeg
+
+  ID 10  |  compro_1.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 21/08/2026
+  Trecho: rcado | pago | & Comprovante de Pix | 21/agosto/2026 às 12:34:40. | R$ 13º? | Origem e destino | & VIACOTTONINDUSTRIA DE MALHAS E | LENCOISLTDA .- | Mercado Pago | CNPJ: 28.338.300/0001
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701149327\compro_1.jpeg
+
+  ID 38  |  compro.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 21/08/2026
+  Trecho: rcado | pago | & Comprovante de Pix | 21/agosto/2026 às 12:34:40. | R$ 13º? | Origem e destino | & VIACOTTONINDUSTRIA DE MALHAS E | LENCOISLTDA .- | Mercado Pago | CNPJ: 28.338.300/0001
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701149327\compro.jpeg
+
+  ID 61  |  compro.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 21/08/2026
+  Trecho: rcado | pago | & Comprovante de Pix | 21/agosto/2026 às 12:34:40. | R$ 13º? | Origem e destino | & VIACOTTONINDUSTRIA DE MALHAS E | LENCOISLTDA .- | Mercado Pago | CNPJ: 28.338.300/0001
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701149327\compro.jpeg
+
+  ID 62  |  compro_1.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 21/08/2026
+  Trecho: rcado | pago | & Comprovante de Pix | 21/agosto/2026 às 12:34:40. | R$ 13º? | Origem e destino | & VIACOTTONINDUSTRIA DE MALHAS E | LENCOISLTDA .- | Mercado Pago | CNPJ: 28.338.300/0001
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701149327\compro_1.jpeg
+
+------------------------------------------------------------------------------
+REMESSA 18167701208299 (2 item(ns))
+------------------------------------------------------------------------------
+
+  ID 11  |  com_.jpeg
+  Motivo: valor ausente / sem valor no documento
+  Data atual: 15/09/2026
+  Trecho: mercado | pago | &O Comprovante de Pix | 15/setembro/2026 às 13:46:08. | Origem e destino | &S Gesiely da Silva Carvalho | Mercado Pago | CPF: *** 151.722-** | & JadlogLogistica S.a | BANCO DO BRASIL S.A. | CNPJ: 04.884.
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701208299\com_.jpeg
+
+  ID 12  |  com__1.jpeg
+  Motivo: valor ausente / sem valor no documento
+  Data atual: 15/09/2026
+  Trecho: mercado | pago | &O Comprovante de Pix | 15/setembro/2026 às 13:46:08. | Origem e destino | &S Gesiely da Silva Carvalho | Mercado Pago | CPF: *** 151.722-** | & JadlogLogistica S.a | BANCO DO BRASIL S.A. | CNPJ: 04.884.
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701208299\com__1.jpeg
+
+------------------------------------------------------------------------------
+REMESSA 18167701255933 (2 item(ns))
+------------------------------------------------------------------------------
+
+  ID 34  |  compr.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 23/10/2026
+  Trecho: cado | pago | & Comprovante de Pix | 23/outubro/2026 às 11:43:55. | R$ 352?º | Origem e destino | & Arlene Chaul Monteiro Alves Rodrigues | Mercado Pago | CPF: *** 110.712-+* | OQ Jadlog
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701255933\compr.jpeg
+
+  ID 58  |  compr.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 23/10/2026
+  Trecho: cado | pago | & Comprovante de Pix | 23/outubro/2026 às 11:43:55. | R$ 352?º | Origem e destino | & Arlene Chaul Monteiro Alves Rodrigues | Mercado Pago | CPF: *** 110.712-+* | OQ Jadlog
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701255933\compr.jpeg
+
+------------------------------------------------------------------------------
+REMESSA 18167701261423 (2 item(ns))
+------------------------------------------------------------------------------
+
+  ID 35  |  medias_2026_10_1792759550367_bf22bc76-4e99-45f7-9dcc-4e12518c7866.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 23/10/2026
+  Trecho: rcado | pago | O Comprovante de Pix | 23/outubro/2026 às 9:45:16. | R$ 100” | Origem e destino | <& ML-PRODUTOS DE BELEZALTDA .- | Mercado Pago | CNPJ: 56.126.128/0001-50 | O Jadlog Log
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701261423\medias_2026_10_1792759550367_bf22bc76-4e99-45f7-9dcc-4e12518c7866.jpeg
+
+  ID 57  |  medias_2026_10_1792759550367_bf22bc76-4e99-45f7-9dcc-4e12518c7866.jpeg
+  Motivo: valor ausente / OCR corrompido
+  Data atual: 23/10/2026
+  Trecho: rcado | pago | O Comprovante de Pix | 23/outubro/2026 às 9:45:16. | R$ 100” | Origem e destino | <& ML-PRODUTOS DE BELEZALTDA .- | Mercado Pago | CNPJ: 56.126.128/0001-50 | O Jadlog Log
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18167701261423\medias_2026_10_1792759550367_bf22bc76-4e99-45f7-9dcc-4e12518c7866.jpeg
+
+------------------------------------------------------------------------------
+REMESSA 18177300053036 (4 item(ns))
+------------------------------------------------------------------------------
+
+  ID 27  |  WhatsApp Image 2026-10-21 at 08.24.27.jpeg
+  Motivo: valor ausente / valor legivel no texto
+  Data atual: 20/10/2026
+  Trecho: ado | pago | &O Comprovante de Pix | 20/outubro/2026 às 16:24:13. | R$ 38:3º | Origem e destino | & Elinando de Jesus Oliveira | Mercado Pago | CPF: *** 298.754-** | O Jadlog Logistic
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18177300053036\WhatsApp Image 2026-10-21 at 08.24.27.jpeg
+
+  ID 28  |  WhatsApp Image 2026-10-21 at 08.24.27_1.jpeg
+  Motivo: valor ausente / valor legivel no texto
+  Data atual: 20/10/2026
+  Trecho: ado | pago | &O Comprovante de Pix | 20/outubro/2026 às 16:24:13. | R$ 38:3º | Origem e destino | & Elinando de Jesus Oliveira | Mercado Pago | CPF: *** 298.754-** | O Jadlog Logistic
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18177300053036\WhatsApp Image 2026-10-21 at 08.24.27_1.jpeg
+
+  ID 43  |  WhatsApp Image 2026-10-21 at 08.24.27.jpeg
+  Motivo: valor ausente / valor legivel no texto
+  Data atual: 20/10/2026
+  Trecho: ado | pago | &O Comprovante de Pix | 20/outubro/2026 às 16:24:13. | R$ 38:3º | Origem e destino | & Elinando de Jesus Oliveira | Mercado Pago | CPF: *** 298.754-** | O Jadlog Logistic
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18177300053036\WhatsApp Image 2026-10-21 at 08.24.27.jpeg
+
+  ID 44  |  WhatsApp Image 2026-10-21 at 08.24.27_1.jpeg
+  Motivo: valor ausente / valor legivel no texto
+  Data atual: 20/10/2026
+  Trecho: ado | pago | &O Comprovante de Pix | 20/outubro/2026 às 16:24:13. | R$ 38:3º | Origem e destino | & Elinando de Jesus Oliveira | Mercado Pago | CPF: *** 298.754-** | O Jadlog Logistic
+  Arquivo: C:\Users\talita.silva\Desktop\APPS\PROJETOS\reembolsos-jadlog\data\Reembolsos\18177300053036\WhatsApp Image 2026-10-21 at 08.24.27_1.jpeg
+
+==============================================================================
+  RESUMO POR MOTIVO
+==============================================================================
+
+   14  valor ausente / OCR corrompido
+    4  valor ausente / valor legivel no texto
+    2  data ausente / valor legivel no texto
+    2  valor ausente / sem valor no documento
