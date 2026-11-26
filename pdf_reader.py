@@ -1,1092 +1,805 @@
-"""Extracao de campos estruturados por tipo de documento.
+"""Extração de campos de guias e comprovantes.
 
-Etapa 5: consulta o cache de layouts por hash antes de tentar todos os
-rotulos. Se o formato ja foi visto, usa os rotulos que funcionaram.
+ESTRATÉGIA: extração por âncoras, tolerante a layout embaralhado.
 
-Inclui extracao de CNPJ da guia (contribuinte) e do comprovante (pagador),
-alem da razao social do tomador na guia.
+O extrator antigo exigia uma sequência rígida de linhas (CNPJ, depois
+vencimento, depois razão social, cada um em sua própria linha). Quando o
+OCR reorganizava o texto — o que acontece com frequência em DARE de
+Roraima — a regex falhava e o valor caía no fallback, que pegava o maior
+número do documento (CGF, número da guia, documento de origem).
 
-MODELOS DE GUIA SUPORTADOS:
-1. PADRAO - guias com rotulos "Total a pagar", "Valor da guia",
-            "Data de vencimento", "Numero da NF".
-2. DARE   - Documento de Arrecadacao de Receitas Estaduais (modelo
-            nacional, usado por RR e outros estados). Rotulos:
-            "Total", "Valor da Receita", "Vencimento", "Notas Fiscais",
-            "Nº da Guia", "Documento de Origem".
+Agora cada campo é buscado de forma independente, por uma lista de
+estratégias em ordem de confiança. A primeira que acerta vence, e o nome
+da regra vencedora fica registrado em _rotulos para diagnóstico.
 
-O extrator padrao roda primeiro. Se valor_guia ou data_vencimento vierem
-vazios, o extrator DARE roda como fallback e preenche apenas os campos
-que estao faltando. Nada do que o padrao ja leu e sobrescrito.
+FORMATOS SUPORTADOS:
 
-DATAS: todas as datas sao devolvidas no formato dd/mm/yyyy, que e o que a
-planilha de exportacao espera. Aceita cinco formatos de entrada:
-- numerico: 21/08/2026, 21-08-2026, 21.08.2026
-- por extenso: 21/agosto/2026, 9/setembro/2026 (comprovante Mercado Pago)
-- abreviado: 23 OUT 2026, 15 SET 2026 (comprovante Nubank)
-- InfinitePay: 07 Out, 2026 (comprovante InfinitePay)
-- ISO: 2026-08-21
+GUIAS
+1. DARE Roraima, layout A (VINICIUS_SOUSA1):
+   CNPJ na mesma linha do CGF e da PLACA.
+   Valor em "TOTAL R$ 21,28" e em "TOTAL A PAGAR ... R$ 21,28".
+2. DARE Roraima, layout B (Caroline_Peres_Sanches1):
+   texto em colunas intercaladas, com números soltos à direita.
+   Valor em "Total" seguido de "25,03" em linha separada.
+3. DARE Roraima, layout C (JULIANA MINOTTO VENZEL1):
+   rótulos empilhados no topo (TOTAL, JUROS, MULTA, ATUALIZAÇÃO,
+   PRINCIPAL) e valores empilhados embaixo, na mesma ordem.
+   Resolvido pela estratégia 4 (bloco por posição).
+4. Guia padrão: "Total a pagar", "Valor total", "Valor da guia".
 
-VALORES: a cadeia de extracao tenta, nesta ordem:
-1. rotulos especificos do tipo de documento
-2. rotulos genericos (valor, total, pago)
-3. valor_tolerante (heuristica por proximidade)
-4. _valor_sem_virgula (OCR removeu a virgula: "R$ 5175" -> 51.75)
-5. _valor_fallback (ultimo recurso, rejeita CPF/CNPJ)
+COMPROVANTES JADLOG (pagamento da guia)
+1. Banco do Brasil, layout A (VINICIUS_SOUSA2):
+   "VALOR DO DOCUMENTO: R$ 21,28", "DATA DO PAGAMENTO: 13/10/2026".
+2. Banco do Brasil, layout B (AMANDA2_1):
+   "Valor Total 21,71", "Data do pagamento 24/11/2026".
+3. Outros bancos: "Valor pago", "Valor do pagamento", "Valor".
 
-CONTRATO COM O PIPELINE:
-Cada extrator devolve, alem dos campos de negocio, duas chaves internas:
-- `_rotulos`: mapa campo -> rotulo que funcionou na extracao.
-- `texto`: o texto bruto extraido, usado pelo hash do layout.
-A gravacao do layout NAO acontece aqui. Quem decide gravar e o pipeline.
+COMPROVANTES DO CLIENTE (reembolso)
+Vários bancos e fintechs. Rótulos comuns: "Valor", "Valor pago",
+"Valor do PIX", "Valor transferido", "Valor do depósito".
+
+ESTRATÉGIAS DE BUSCA DE VALOR (em ordem):
+1. Valor na MESMA linha, depois do rótulo
+2. Valor na linha SEGUINTE (layout em colunas)
+3. Valor até 2 linhas depois (colunas intercaladas)
+4. Bloco de rótulos + bloco de valores alinhados por posição
+   (padrão do DARE de Roraima com rótulos empilhados no topo)
+
+REGRA DE SEGURANÇA DO VALOR:
+Nenhum valor é aceito se estiver na mesma linha de CGF, número da guia,
+documento de origem, nota fiscal, autenticação, código de barras ou
+nosso número. Esses campos têm números grandes que o fallback antigo
+confundia com valor.
+
+FALLBACK DA GUIA:
+Quando a guia não tem valor legível, o pipeline pode usar o valor pago
+pela Jadlog como referência. Isso é feito no pipeline, não aqui: este
+módulo devolve valor_guia = None e o pipeline decide.
 """
 
 import re
 from pathlib import Path
 
-import layout_cache
 from config import TipoDoc
 from log_manager import get_logger
-from ocr_engine import extrair_texto
-from utils import normalizar_cnpj, parse_data, parse_valor, validar_cnpj
-from valor_tolerante import valor_tolerante
 
 log = get_logger("pdf_reader")
 
-RE_CNPJ = re.compile(r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}")
-RE_NF_SECAO = re.compile(
-    r"notas?\s*fiscais?[^\n]*\n(.{0,400})", re.IGNORECASE | re.DOTALL
-)
-RE_NF = re.compile(r"\b(\d{3,9})\b")
+# ---------------------------------------------------------------------------
+# PADRÕES BÁSICOS
+# ---------------------------------------------------------------------------
 
-# VALOR: aceita quatro formatos.
-# - 1.234,56  -> milhar com ponto, decimal com virgula (BR)
-# - 1,234.56  -> milhar com virgula, decimal com ponto (US)
-# - 265.44    -> decimal simples com ponto (comprovante Olist/Celcoin)
-# - 265,44    -> decimal simples com virgula (BR)
-RE_VALOR_BRL = re.compile(
-    r"R?\$?\s*("
-    r"\d{1,3}(?:\.\d{3})*,\d{2}"
-    r"|\d{1,3}(?:,\d{3})*\.\d{2}"
-    r"|\d+\.\d{2}"
-    r"|\d+,\d{2}"
-    r")"
-)
+RE_CNPJ = re.compile(r"\b(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})\b")
+RE_DATA = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
+RE_VALOR = re.compile(r"\b(\d{1,3}(?:\.\d{3})*,\d{2})\b")
+RE_VALOR_SEM_MILHAR = re.compile(r"\b(\d{1,6},\d{2})\b")
 
-RE_DATA_BR = re.compile(r"(\d{1,2}[/.-]\d{1,2}[/.-]\d{4})")
-
-# Data com mes por extenso: "21/agosto/2026", "9/setembro/2026"
-RE_DATA_EXTENSO = re.compile(
-    r"(\d{1,2})\s*/\s*"
-    r"(janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|setembro|"
-    r"outubro|novembro|dezembro)"
-    r"\s*/\s*(\d{4})",
-    re.IGNORECASE,
-)
-
-# Data com mes abreviado em maiusculas: "23 OUT 2026", "15 SET 2026"
-RE_DATA_ABREV = re.compile(
-    r"(\d{1,2})\s+"
-    r"(JAN|FEV|MAR|ABR|MAI|JUN|JUL|AGO|SET|OUT|NOV|DEZ)"
-    r"\s+(\d{4})",
-    re.IGNORECASE,
-)
-
-# Data InfinitePay: "07 Out, 2026", "13 Out, 2026"
-RE_DATA_INFINITEPAY = re.compile(
-    r"(\d{1,2})\s+"
-    r"(Jan|Fev|Mar|Abr|Mai|Jun|Jul|Ago|Set|Out|Nov|Dez)"
-    r"\s*,?\s*(\d{4})",
-    re.IGNORECASE,
-)
-
-MESES_EXTENSO = {
-    "janeiro": 1,
-    "fevereiro": 2,
-    "março": 3,
-    "marco": 3,
-    "abril": 4,
-    "maio": 5,
-    "junho": 6,
-    "julho": 7,
-    "agosto": 8,
-    "setembro": 9,
-    "outubro": 10,
-    "novembro": 11,
-    "dezembro": 12,
-}
-
-MESES_ABREV = {
-    "JAN": 1,
-    "FEV": 2,
-    "MAR": 3,
-    "ABR": 4,
-    "MAI": 5,
-    "JUN": 6,
-    "JUL": 7,
-    "AGO": 8,
-    "SET": 9,
-    "OUT": 10,
-    "NOV": 11,
-    "DEZ": 12,
-}
-
-UFS = "AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO"
-
-BANCOS = (
-    "ITAU",
-    "ITAÚ",
-    "BRADESCO",
-    "SANTANDER",
-    "BANCO DO BRASIL",
-    "BB",
-    "CAIXA",
-    "NUBANK",
-    "INTER",
-    "SICOOB",
-    "SICREDI",
-    "BTG",
-    "MERCANTIL",
+# Linhas que contêm números que NUNCA são valor monetário.
+# O fallback antigo pegava o maior número do texto e confundia estes.
+LINHAS_PROIBIDAS_VALOR = (
+    "cgf",
+    "inscricao",
+    "inscrição",
+    "placa",
+    "nosso numero",
+    "nosso número",
+    "nr. documento",
+    "nr documento",
+    "documento de origem",
+    "doc. de origem",
+    "nota fiscal",
+    "autenticacao",
+    "autenticação",
+    "codigo de barras",
+    "código de barras",
+    "acao fiscal",
+    "ação fiscal",
+    "parcela",
+    "sequencia",
+    "sequência",
+    "referencia",
+    "referência",
+    "cnpj",
+    "cpf",
+    "agencia",
+    "agência",
+    "conta",
+    "banco",
+    "convenio",
+    "convênio",
+    "telefone",
+    "sac",
+    "ouvidoria",
 )
 
-CNPJS_A_IGNORAR = (
-    "BANCO DO BRASIL",
-    "CAIXA ECONOMICA",
-    "PREFEITURA",
-    "SECRETARIA",
-    "FAZENDA",
-    "RECEITA FEDERAL",
-    "SEFAZ",
-    "TESOURO",
-    "ITAU",
-    "BRADESCO",
-    "SANTANDER",
-)
-
-ROTULOS_VALOR_GENERICOS = [
-    r"valor\s*(?:do\s*)?(?:documento|pagamento|pago|total|l[ií]quido|bruto)",
-    r"total\s*(?:a\s*pagar|pago|do\s*documento)?",
+# Rótulos de valor por tipo de documento, em ordem de confiança.
+ROTULOS_VALOR_GUIA = (
+    r"total\s*a\s*pagar",
+    r"valor\s*(?:total|da\s*guia|a\s*pagar|do\s*documento)",
+    r"total\s*do\s*documento",
+    r"^\s*total\s*$",
+    r"^\s*total\b",
     r"principal",
-    r"valor",
-]
+)
 
-ROTULOS_DATA_GENERICOS = [
-    r"data\s*(?:do\s*)?(?:pagamento|transa[çc][ãa]o|emiss[ãa]o|vencimento|limite\s*pagamento)",
+ROTULOS_VALOR_JADLOG = (
+    r"valor\s*do\s*documento",
+    r"valor\s*(?:total|pago|do\s*pagamento|liquido|líquido)",
+    r"^\s*valor\b",
+)
+
+ROTULOS_VALOR_CLIENTE = (
+    r"valor\s*(?:do\s*)?(?:pix|transferencia|transferência|deposito|depósito)",
+    r"valor\s*(?:total|pago|do\s*pagamento|liquido|líquido|creditado)",
+    r"^\s*valor\b",
+)
+
+ROTULOS_DATA_GUIA = (
+    r"data\s*(?:limite\s*)?(?:de\s*)?(?:pagamento|vencimento)",
     r"vencimento",
-    r"emiss[ãa]o",
-    r"data",
-]
+    r"data\s*de\s*emissao",
+    r"data\s*de\s*emissão",
+)
 
-ROTULOS_CNPJ_GUIA = [
-    r"cnpj\s*(?:do\s*)?contribuinte",
-    r"cnpj\s*(?:do\s*)?(?:destinat[aá]rio|tomador|devedor)",
-    r"cpf\s*/?\s*cnpj\s*(?:do\s*)?(?:contribuinte|destinat[aá]rio|tomador)",
-    r"contribuinte\s*[:.]?\s*(?:cnpj|cpf)",
-    r"inscri[çc][ãa]o\s*(?:estadual|no\s*estado)",
-    r"cnpj\s*[:.]?\s*",
-    r"cpf\s*/?cnpj",
-    r"raz[ãa]o\s*social",
-    r"nome\s*(?:do\s*)?(?:contribuinte|destinat[aá]rio|tomador)",
-]
+ROTULOS_DATA_JADLOG = (
+    r"data\s*do\s*pagamento",
+    r"data\s*da\s*transacao",
+    r"data\s*da\s*transação",
+    r"data\s*do\s*debito",
+    r"data\s*do\s*débito",
+    r"^\s*data\b",
+)
 
-ROTULOS_CNPJ_PAGADOR = [
-    r"cnpj\s*(?:do\s*)?pagador",
-    r"pagador\s*[:.]?\s*(?:cnpj)?",
-    r"origem",
-    r"debitad[oa]",
-]
+ROTULOS_DATA_CLIENTE = (
+    r"data\s*do\s*pagamento",
+    r"data\s*da\s*transferencia",
+    r"data\s*da\s*transferência",
+    r"data\s*do\s*deposito",
+    r"data\s*do\s*depósito",
+    r"data\s*do\s*pix",
+    r"^\s*data\b",
+)
 
-ROTULOS_RAZAO_SOCIAL = [
-    r"raz[ãa]o\s*social",
-    r"nome\s*(?:do\s*)?(?:contribuinte|destinat[aá]rio|tomador)",
-    r"contribuinte",
-    r"tomador\s*(?:de\s*servi[çc]os)?",
-    r"destinat[aá]rio",
-]
+ROTULOS_CNPJ_PAGADOR = (
+    r"cnpj\s*/?\s*cpf\s*do\s*pagador",
+    r"cnpj\s*do\s*pagador",
+    r"cpf\s*/?\s*cnpj\s*do\s*pagador",
+    r"pagador",
+    r"cnpj\s*/\s*cpf",
+    r"cnpj",
+)
 
-MAPA_OCR = str.maketrans(
-    {
-        "O": "0",
-        "o": "0",
-        "I": "1",
-        "l": "1",
-        "|": "1",
-        "S": "5",
-        "s": "5",
-        "B": "8",
-        "Z": "2",
-        "z": "2",
-        "G": "6",
-    }
+ROTULOS_NOME_PAGADOR = (
+    r"nome\s*do\s*pagador",
+    r"razao\s*social\s*do\s*pagador",
+    r"razão\s*social\s*do\s*pagador",
+    r"pagador",
+    r"cliente",
+    r"nome",
+)
+
+ROTULOS_NUMERO_GUIA = (
+    r"n[ºo°]?\s*da\s*guia",
+    r"numero\s*da\s*guia",
+    r"número\s*da\s*guia",
+)
+
+ROTULOS_NUMERO_NF = (
+    r"nota\s*fiscal\s*n?[ºo°]?\s*",
+    r"n[ºo°]?\s*da\s*nota\s*fiscal",
+    r"numero\s*da\s*nota",
+    r"número\s*da\s*nota",
+    r"nf[-\s]?e?\s*n?[ºo°]?\s*",
+)
+
+ROTULOS_TRIBUTO = (
+    r"tributo",
+    r"codigo\s*do\s*tributo",
+    r"código\s*do\s*tributo",
+)
+
+# Rótulos que formam o bloco de valores do DARE, na ordem em que aparecem.
+# Usado pela estratégia 4 (bloco por posição).
+ROTULOS_BLOCO_DARE = (
+    r"^\s*total\s*$",
+    r"^\s*juros\s*$",
+    r"^\s*multa\s*$",
+    r"^\s*atualizacao\s*$",
+    r"^\s*atualização\s*$",
+    r"^\s*principal\s*$",
 )
 
 
 # ---------------------------------------------------------------------------
-# VALIDACAO DE CNPJ
+# NORMALIZAÇÃO
 # ---------------------------------------------------------------------------
-def _corrigir_ocr_cnpj(texto: str) -> str:
-    return texto.translate(MAPA_OCR)
 
 
-def _cnpj_valido(texto: str) -> str:
-    cnpj = normalizar_cnpj(texto)
-    if cnpj and validar_cnpj(cnpj):
-        return cnpj
-    corrigido = normalizar_cnpj(_corrigir_ocr_cnpj(texto))
-    if corrigido and validar_cnpj(corrigido):
-        return corrigido
-    return ""
+def _normalizar_texto(texto: str) -> str:
+    """Padroniza o texto para as buscas.
 
-
-# ---------------------------------------------------------------------------
-# HELPERS DE EXTRACAO
-# ---------------------------------------------------------------------------
-def _primeiro_cnpj(texto: str) -> str:
-    for m in RE_CNPJ.finditer(texto):
-        cnpj = _cnpj_valido(m.group(0))
-        if cnpj:
-            return cnpj
-    return ""
-
-
-def _cnpj_apos_rotulo(texto: str, rotulos: list[str]) -> str:
-    for rotulo in rotulos:
-        padrao = rf"{rotulo}[\s\S]{{0,200}}?({RE_CNPJ.pattern})"
-        for m in re.finditer(padrao, texto, re.IGNORECASE):
-            cnpj = _cnpj_valido(m.group(1))
-            if cnpj:
-                return cnpj
-    return ""
-
-
-def _razao_social_apos_rotulo(texto: str, rotulos: list[str]) -> str:
-    for rotulo in rotulos:
-        padrao = rf"{rotulo}[\s:.\-]*\n?\s*([A-ZÀ-Ú0-9][A-ZÀ-Ú0-9&\s.\-/]{{4,90}})"
-        m = re.search(padrao, texto, re.IGNORECASE)
-        if m:
-            nome = re.sub(r"\s+", " ", m.group(1)).strip(" .-")
-            if len(nome) >= 4:
-                return nome
-    return ""
-
-
-def _cnpj_por_proximidade_nome(texto: str, nome: str) -> str:
-    if not nome:
+    - Converte CRLF em LF
+    - Colapsa espaços múltiplos, preservando quebras de linha
+    """
+    if not texto:
         return ""
-    nome_re = re.escape(nome[:40])
-    padrao = rf"{nome_re}[\s\S]{{0,300}}?({RE_CNPJ.pattern})"
-    for m in re.finditer(padrao, texto, re.IGNORECASE):
-        cnpj = _cnpj_valido(m.group(1))
-        if cnpj:
-            return cnpj
-    return ""
+    t = texto.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"[ \t]+", " ", t)
+    return t
 
 
-def _cnpj_nao_e_orgao(cnpj: str, texto: str) -> bool:
-    if not cnpj:
-        return True
-    pos = texto.find(cnpj)
-    if pos < 0:
-        fmt = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
-        pos = texto.find(fmt)
-    if pos < 0:
-        return True
-    inicio = max(0, pos - 120)
-    contexto = texto[inicio:pos].upper()
-    return not any(orgao in contexto for orgao in CNPJS_A_IGNORAR)
-
-
-def _cnpj_guia(texto: str, nome_tomador: str = "") -> str:
-    cnpj = _cnpj_apos_rotulo(texto, ROTULOS_CNPJ_GUIA)
-    if cnpj and _cnpj_nao_e_orgao(cnpj, texto):
-        return cnpj
-    cnpj = _cnpj_por_proximidade_nome(texto, nome_tomador)
-    if cnpj and _cnpj_nao_e_orgao(cnpj, texto):
-        return cnpj
-    for m in RE_CNPJ.finditer(texto):
-        cnpj = _cnpj_valido(m.group(0))
-        if cnpj and _cnpj_nao_e_orgao(cnpj, texto):
-            return cnpj
-    return _primeiro_cnpj(texto)
-
-
-def _cnpj_pagador_comprovante(texto: str, nome_pagador: str) -> str:
-    if nome_pagador:
-        linha = re.search(
-            rf"{re.escape(nome_pagador)}[^\n]{{0,80}}({RE_CNPJ.pattern})",
-            texto,
-        )
-        if linha:
-            cnpj = _cnpj_valido(linha.group(1))
-            if cnpj:
-                return cnpj
-    cnpj = _cnpj_apos_rotulo(texto, ROTULOS_CNPJ_PAGADOR)
-    if cnpj:
-        return cnpj
-    return _primeiro_cnpj(texto)
-
-
-def _valor_apos_rotulo(texto: str, rotulos: list[str]) -> tuple[float | None, str]:
-    for rotulo in rotulos:
-        padrao = rf"{rotulo}[\s\S]{{0,150}}?{RE_VALOR_BRL.pattern}"
-        m = re.search(padrao, texto, re.IGNORECASE)
-        if m:
-            v = parse_valor(m.group(1))
-            if v:
-                return v, rotulo
-    return None, ""
-
-
-def _data_apos_rotulo(texto: str, rotulos: list[str]) -> tuple[str | None, str]:
-    """Retorna (data em dd/mm/yyyy, rotulo que casou).
-
-    Aceita quatro formatos:
-    - numerico: 21/08/2026, 21-08-2026, 21.08.2026
-    - por extenso: 21/agosto/2026, 9/setembro/2026 (Mercado Pago)
-    - abreviado: 23 OUT 2026, 15 SET 2026 (Nubank)
-    - InfinitePay: 07 Out, 2026
-
-    Sempre devolve no formato dd/mm/yyyy, que e o que a planilha espera.
-    """
-    for rotulo in rotulos:
-        padrao_janela = rf"{rotulo}[\s\S]{{0,150}}"
-        m_janela = re.search(padrao_janela, texto, re.IGNORECASE)
-        if not m_janela:
-            continue
-        trecho = texto[m_janela.start() : m_janela.end() + 60]
-
-        # 1) Mes por extenso: 21/agosto/2026
-        m_ext = RE_DATA_EXTENSO.search(trecho)
-        if m_ext:
-            dia, mes_nome, ano = m_ext.groups()
-            mes_num = MESES_EXTENSO.get(mes_nome.lower())
-            if mes_num:
-                return f"{int(dia):02d}/{mes_num:02d}/{ano}", rotulo
-
-        # 2) Numerico: 21/08/2026
-        m_num = RE_DATA_BR.search(trecho)
-        if m_num:
-            bruto = m_num.group(1)
-            partes = re.split(r"[/.-]", bruto)
-            if len(partes) == 3:
-                dia, mes, ano = partes
-                return f"{int(dia):02d}/{int(mes):02d}/{ano}", rotulo
-
-        # 3) InfinitePay: 07 Out, 2026
-        m_inf = RE_DATA_INFINITEPAY.search(trecho)
-        if m_inf:
-            dia, mes_abrev, ano = m_inf.groups()
-            mes_num = MESES_ABREV.get(mes_abrev.upper())
-            if mes_num:
-                return f"{int(dia):02d}/{mes_num:02d}/{ano}", rotulo
-
-        # 4) Mes abreviado: 23 OUT 2026
-        m_abrev = RE_DATA_ABREV.search(trecho)
-        if m_abrev:
-            dia, mes_abrev, ano = m_abrev.groups()
-            mes_num = MESES_ABREV.get(mes_abrev.upper())
-            if mes_num:
-                return f"{int(dia):02d}/{mes_num:02d}/{ano}", rotulo
-
-    return None, ""
-
-
-def _valor_sem_virgula(texto: str) -> float | None:
-    """Recupera valor quando o OCR removeu a virgula decimal.
-
-    O comprovante Mercado Pago as vezes sai como 'R$ 5175' em vez de
-    'R$ 51,75'. Os dois ultimos digitos sao sempre os centavos.
-
-    Exemplos reais:
-    - "R$ 5175"  -> 51.75
-    - "R$ 61323" -> 613.23
-    - "R$ 11223" -> 112.23
-    - "R$ 24554" -> 245.54
-
-    Retorna None quando o valor esta corrompido com simbolos
-    ("R$ 38ºº", "R$ 352?º"), porque nesse caso nao ha como recuperar.
-    """
-    for m in re.finditer(r"R\$\s*(\d{4,7})\b", texto):
-        bruto = m.group(1)
-        try:
-            valor = float(bruto[:-2] + "." + bruto[-2:])
-        except ValueError:
-            continue
-        if 0 < valor < 10_000_000:
-            return valor
-    return None
-
-
-def _valor_dentro_de_documento(valor: float, texto: str) -> bool:
-    """Verifica se o valor extraido na verdade e parte de um CNPJ ou CPF.
-
-    O OCR frequentemente le '37.242.743/0001-88' e a regex de valor casa
-    '37.24' no inicio. Este filtro rejeita esse caso.
-    """
-    if valor is None:
-        return False
-    candidatos = [
-        f"{valor:.2f}",
-        f"{valor:.2f}".replace(".", ","),
-    ]
-    for cand in candidatos:
-        pos = texto.find(cand)
-        while pos >= 0:
-            inicio = max(0, pos - 30)
-            fim = min(len(texto), pos + len(cand) + 30)
-            contexto = texto[inicio:fim]
-            if re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", contexto):
-                return True
-            if re.search(r"\*{2,}\s*\d{3}\.\d{3}", contexto):
-                return True
-            if re.search(r"(?:CPF|CNPJ)\s*:?\s*\*{0,3}\s*$", contexto[:60]):
-                return True
-            pos = texto.find(cand, pos + 1)
-    return False
-
-
-def _valor_corrompido_no_texto(texto: str) -> bool:
-    """Detecta quando o valor real esta ilegivel no OCR.
-
-    Casos reais:
-    - 'R$ 38ºº'    -> simbolos no lugar dos digitos
-    - 'R$ 352?º'   -> interrogacao e ordinal
-    - 'R$ 38:3º'   -> dois pontos e ordinal
-    - 'R$ 100"'    -> aspas no lugar dos centavos
-    """
-    padrao = re.compile(r"R\$\s*[\d]*[º°?\"”'`:;][\dº°?\"”'`:;]*")
-    return bool(padrao.search(texto))
-
-
-def _valor_fallback(texto: str) -> float | None:
-    """Maior valor plausivel do texto, exigindo contexto de valor.
-
-    Diferente da versao antiga, nao aceita qualquer numero solto:
-    - precisa estar a ate 100 caracteres de um rotulo de valor
-    - nao pode estar dentro de CPF, CNPJ, ID de transacao ou conta
-
-    Isso evita que o fallback invente valores a partir de CPF, CNPJ ou
-    numero de transacao quando o OCR corrompe o valor real.
-    """
-    rotulos = re.compile(
-        r"(?:valor|total|pago|pagar|R\$|reais)",
-        re.IGNORECASE,
+def _sem_acento(s: str) -> str:
+    """Remove acentos para comparação de rótulos."""
+    tabela = str.maketrans(
+        "áàâãäéèêëíìîïóòôõöúùûüçÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ",
+        "aaaaaeeeeiiiiooooouuuucAAAAAEEEEIIIIOOOOOUUUUC",
     )
-    proibidos = re.compile(
-        r"(?:CPF|CNPJ|ag[êe]ncia|conta|transa[çc][ãa]o|ID|autentica)",
-        re.IGNORECASE,
-    )
+    return s.translate(tabela)
+
+
+def _linha_proibida(linha: str) -> bool:
+    """Indica se a linha contém número que não pode ser valor monetário."""
+    baixa = _sem_acento(linha.lower())
+    return any(p in baixa for p in LINHAS_PROIBIDAS_VALOR)
+
+
+def _valor_valido(bruto: str) -> float | None:
+    """Converte '21,28' ou '1.234,56' em float. None se inválido."""
+    if not bruto:
+        return None
+    s = bruto.strip().replace("R$", "").replace(" ", "")
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        v = float(s)
+    except (ValueError, TypeError):
+        return None
+    # Descarta valores absurdos que indicam número de documento
+    if v <= 0 or v > 10_000_000:
+        return None
+    return round(v, 2)
+
+
+def _cnpj_valido(bruto: str) -> str | None:
+    """Normaliza um CNPJ para 14 dígitos. None se inválido."""
+    if not bruto:
+        return None
+    d = re.sub(r"\D", "", bruto)
+    if len(d) != 14:
+        return None
+    if len(set(d)) == 1:
+        return None
+    return d
+
+
+def _data_valida(bruto: str) -> str | None:
+    """Valida dd/mm/yyyy e devolve no mesmo formato."""
+    if not bruto:
+        return None
+    m = RE_DATA.search(bruto)
+    if not m:
+        return None
+    s = m.group(1)
+    try:
+        d, mes, a = s.split("/")
+        di, mi, ai = int(d), int(mes), int(a)
+    except (ValueError, TypeError):
+        return None
+    if not (1 <= di <= 31 and 1 <= mi <= 12 and 1990 <= ai <= 2100):
+        return None
+    return s
+
+
+# ---------------------------------------------------------------------------
+# BUSCA ANCORADA
+# ---------------------------------------------------------------------------
+
+
+def _valor_por_bloco(
+    linhas: list[str],
+    indice_rotulo: int,
+    rotulo: str,
+    rotulo_log: dict,
+    campo: str,
+) -> float | None:
+    """Casa rótulo e valor por posição em blocos separados.
+
+    Padrão do DARE de Roraima: os rótulos (TOTAL, JUROS, MULTA,
+    ATUALIZAÇÃO, PRINCIPAL) aparecem juntos no topo, e os valores
+    aparecem juntos embaixo, na mesma ordem.
+
+    A posição do rótulo é contada entre os rótulos do bloco que
+    aparecem ANTES dele no texto, não pelo índice fixo. Assim funciona
+    mesmo quando algum rótulo falta ou aparece em ordem diferente.
+    """
+    # Confirma que o rótulo atual é do bloco
+    if not any(
+        re.match(p, _sem_acento(linhas[indice_rotulo].lower()))
+        for p in ROTULOS_BLOCO_DARE
+    ):
+        return None
+
+    # Conta quantos rótulos do bloco aparecem ANTES deste
+    posicao = 0
+    for j in range(indice_rotulo):
+        if any(re.match(p, _sem_acento(linhas[j].lower())) for p in ROTULOS_BLOCO_DARE):
+            posicao += 1
+
+    # Coleta os valores do bloco, na ordem em que aparecem
     valores = []
-    for m in RE_VALOR_BRL.finditer(texto):
-        v = parse_valor(m.group(1))
-        if not v or not (0 < v < 10_000_000):
+    for linha in linhas[indice_rotulo + 1 :]:
+        if _linha_proibida(linha):
             continue
-        inicio = max(0, m.start() - 100)
-        contexto = texto[inicio : m.start()]
-        # Precisa ter rotulo de valor por perto
-        if not rotulos.search(contexto):
-            continue
-        # Nao pode estar dentro de CPF/CNPJ/conta/transacao
-        if proibidos.search(contexto[-40:]):
-            continue
-        valores.append(v)
-    return max(valores) if valores else None
+        achado = RE_VALOR.search(linha) or RE_VALOR_SEM_MILHAR.search(linha)
+        if achado:
+            v = _valor_valido(achado.group(1))
+            if v is not None:
+                valores.append(v)
+        # Para quando tiver valores suficientes para cobrir a posição
+        if len(valores) > posicao:
+            break
 
-
-def _data_fallback(texto: str) -> str | None:
-    """Primeira data valida do texto, em dd/mm/yyyy.
-
-    Ordem de tentativa:
-    1. Mes por extenso: 21/agosto/2026 (comprovante Mercado Pago)
-    2. Numerico brasileiro: 21/08/2026, 21-08-2026, 21.08.2026
-    3. InfinitePay: 07 Out, 2026
-    4. Mes abreviado: 23 OUT 2026 (comprovante Nubank)
-    5. ISO: 2026-08-21
-
-    Sempre devolve dd/mm/yyyy, que e o formato da planilha.
-    """
-    # 1) Mes por extenso (mais especifico)
-    m = RE_DATA_EXTENSO.search(texto)
-    if m:
-        dia, mes_nome, ano = m.groups()
-        mes_num = MESES_EXTENSO.get(mes_nome.lower())
-        if mes_num:
-            return f"{int(dia):02d}/{mes_num:02d}/{ano}"
-
-    # 2) Numerico brasileiro
-    for m in RE_DATA_BR.finditer(texto):
-        bruto = m.group(1)
-        partes = re.split(r"[/.-]", bruto)
-        if len(partes) == 3:
-            dia, mes, ano = partes
-            if 2000 <= int(ano) <= 2100:
-                return f"{int(dia):02d}/{int(mes):02d}/{ano}"
-
-    # 3) InfinitePay: 07 Out, 2026
-    m = RE_DATA_INFINITEPAY.search(texto)
-    if m:
-        dia, mes_abrev, ano = m.groups()
-        mes_num = MESES_ABREV.get(mes_abrev.upper())
-        if mes_num:
-            return f"{int(dia):02d}/{mes_num:02d}/{ano}"
-
-    # 4) Mes abreviado: 23 OUT 2026
-    m = RE_DATA_ABREV.search(texto)
-    if m:
-        dia, mes_abrev, ano = m.groups()
-        mes_num = MESES_ABREV.get(mes_abrev.upper())
-        if mes_num:
-            return f"{int(dia):02d}/{mes_num:02d}/{ano}"
-
-    # 5) ISO (YYYY-MM-DD)
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", texto)
-    if m:
-        ano, mes, dia = m.groups()
-        return f"{dia}/{mes}/{ano}"
+    if posicao < len(valores):
+        rotulo_log[campo] = f"rotulo:{rotulo}|bloco_posicao_{posicao}"
+        return valores[posicao]
 
     return None
 
 
-def _valor_com_cache(
-    texto: str, rotulos: list[str], rotulo_cache: str | None
-) -> tuple[float | None, str]:
-    if rotulo_cache:
-        v, _ = _valor_apos_rotulo(texto, [rotulo_cache])
-        if v is not None:
-            return v, rotulo_cache
-    v, r = _valor_apos_rotulo(texto, rotulos)
-    if v is not None:
-        return v, r
-    v, r = _valor_apos_rotulo(texto, ROTULOS_VALOR_GENERICOS)
-    if v is not None:
-        return v, r
-    return _valor_fallback(texto), ""
+def _buscar_valor_por_rotulo(
+    texto: str, rotulos: tuple[str, ...], rotulo_log: dict, campo: str
+) -> float | None:
+    """Procura o valor associado a um rótulo, tolerando layout embaralhado.
 
+    Estratégias, em ordem:
+    1. Valor na MESMA linha, depois do rótulo
+    2. Valor na linha SEGUINTE (layout em colunas)
+    3. Valor até 2 linhas depois (colunas intercaladas)
+    4. Bloco de rótulos + bloco de valores alinhados por posição
+       (padrão do DARE de Roraima: rótulos em coluna no topo, valores
+       em coluna embaixo, na mesma ordem)
 
-def _data_com_cache(
-    texto: str, rotulos: list[str], rotulo_cache: str | None
-) -> tuple[str | None, str]:
-    if rotulo_cache:
-        d, _ = _data_apos_rotulo(texto, [rotulo_cache])
-        if d is not None:
-            return d, rotulo_cache
-    d, r = _data_apos_rotulo(texto, rotulos)
-    if d is not None:
-        return d, r
-    d, r = _data_apos_rotulo(texto, ROTULOS_DATA_GENERICOS)
-    if d is not None:
-        return d, r
-    return _data_fallback(texto), ""
-
-
-def _extrair_nf(texto: str) -> str:
-    secao = RE_NF_SECAO.search(texto)
-    alvo = secao.group(1) if secao else ""
-    if alvo:
-        m = re.search(r"(?:NF|NOTA\s*FISCAL)\s*[:\-]?\s*(\d{3,9})", alvo, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        m = RE_NF.search(alvo)
-        if m:
-            return m.group(1)
-    m = re.search(r"(?:NF|NOTA\s*FISCAL)\s*[:\-]?\s*(\d{3,9})", texto, re.IGNORECASE)
-    return m.group(1) if m else ""
-
-
-# ---------------------------------------------------------------------------
-# GUIA - MODELO DARE (Documento de Arrecadacao de Receitas Estaduais)
-# ---------------------------------------------------------------------------
-def _extrair_dare(texto: str) -> dict:
-    """Extrator para o modelo DARE (Documento de Arrecadacao de Receitas
-    Estaduais), usado por RR e outros estados.
-
-    O OCR da DARE separa o documento em dois blocos:
-    1. Bloco de rotulos (CNPJ/CPF, Vencimento, Total, ...)
-    2. Bloco de valores, na mesma ordem dos rotulos
-
-    Por isso a extracao nao ancora rotulo->valor. Ela localiza o bloco de
-    valores e le por posicao, que e o que o layout garante.
-
-    Devolve os mesmos nomes de campo do extrator padrao, para o pipeline
-    nao precisar saber qual modelo foi usado.
+    Descarta linhas proibidas (CGF, número da guia, código de barras).
+    Registra em rotulo_log qual regra venceu.
     """
+    linhas = texto.split("\n")
 
-    def _num(s: str) -> float | None:
+    for rotulo in rotulos:
         try:
-            if "," in s:
-                return float(s.replace(".", "").replace(",", "."))
-            return float(s)
-        except (ValueError, AttributeError):
-            return None
+            re_rotulo = re.compile(rotulo, re.IGNORECASE)
+        except re.error:
+            continue
 
+        for i, linha in enumerate(linhas):
+            if not re_rotulo.search(_sem_acento(linha.lower())):
+                continue
+            if _linha_proibida(linha) and "total" not in rotulo.lower():
+                continue
+
+            # Estratégia 1: mesma linha, depois do rótulo
+            m = re_rotulo.search(_sem_acento(linha.lower()))
+            if m:
+                resto = linha[m.end() :]
+                achado = RE_VALOR.search(resto) or RE_VALOR_SEM_MILHAR.search(resto)
+                if achado:
+                    v = _valor_valido(achado.group(1))
+                    if v is not None:
+                        rotulo_log[campo] = f"rotulo:{rotulo}|mesma_linha"
+                        return v
+
+            # Estratégia 2: linha seguinte
+            if i + 1 < len(linhas):
+                prox = linhas[i + 1]
+                if not _linha_proibida(prox):
+                    achado = RE_VALOR.search(prox) or RE_VALOR_SEM_MILHAR.search(prox)
+                    if achado:
+                        v = _valor_valido(achado.group(1))
+                        if v is not None:
+                            rotulo_log[campo] = f"rotulo:{rotulo}|linha_seguinte"
+                            return v
+
+            # Estratégia 3: até 2 linhas depois (colunas intercaladas)
+            for j in range(i + 1, min(i + 3, len(linhas))):
+                alvo = linhas[j]
+                if _linha_proibida(alvo):
+                    continue
+                achado = RE_VALOR.search(alvo) or RE_VALOR_SEM_MILHAR.search(alvo)
+                if achado:
+                    v = _valor_valido(achado.group(1))
+                    if v is not None:
+                        rotulo_log[campo] = f"rotulo:{rotulo}|linha_{j - i}"
+                        return v
+
+            # Estratégia 4: bloco de rótulos + bloco de valores
+            v = _valor_por_bloco(linhas, i, rotulo, rotulo_log, campo)
+            if v is not None:
+                return v
+
+    return None
+
+
+def _buscar_data_por_rotulo(
+    texto: str, rotulos: tuple[str, ...], rotulo_log: dict, campo: str
+) -> str | None:
+    """Procura a data associada a um rótulo."""
+    linhas = texto.split("\n")
+
+    for rotulo in rotulos:
+        try:
+            re_rotulo = re.compile(rotulo, re.IGNORECASE)
+        except re.error:
+            continue
+
+        for i, linha in enumerate(linhas):
+            if not re_rotulo.search(_sem_acento(linha.lower())):
+                continue
+
+            m = re_rotulo.search(_sem_acento(linha.lower()))
+            if m:
+                resto = linha[m.end() :]
+                achado = RE_DATA.search(resto)
+                if achado:
+                    d = _data_valida(achado.group(1))
+                    if d:
+                        rotulo_log[campo] = f"rotulo:{rotulo}|mesma_linha"
+                        return d
+
+            if i + 1 < len(linhas):
+                achado = RE_DATA.search(linhas[i + 1])
+                if achado:
+                    d = _data_valida(achado.group(1))
+                    if d:
+                        rotulo_log[campo] = f"rotulo:{rotulo}|linha_seguinte"
+                        return d
+
+    return None
+
+
+def _buscar_cnpj_por_rotulo(
+    texto: str, rotulos: tuple[str, ...], rotulo_log: dict, campo: str
+) -> str | None:
+    """Procura o CNPJ associado a um rótulo."""
+    linhas = texto.split("\n")
+
+    for rotulo in rotulos:
+        try:
+            re_rotulo = re.compile(rotulo, re.IGNORECASE)
+        except re.error:
+            continue
+
+        for i, linha in enumerate(linhas):
+            if not re_rotulo.search(_sem_acento(linha.lower())):
+                continue
+
+            m = re_rotulo.search(_sem_acento(linha.lower()))
+            if m:
+                resto = linha[m.end() :]
+                achado = RE_CNPJ.search(resto)
+                if achado:
+                    c = _cnpj_valido(achado.group(1))
+                    if c:
+                        rotulo_log[campo] = f"rotulo:{rotulo}|mesma_linha"
+                        return c
+
+            if i + 1 < len(linhas):
+                achado = RE_CNPJ.search(linhas[i + 1])
+                if achado:
+                    c = _cnpj_valido(achado.group(1))
+                    if c:
+                        rotulo_log[campo] = f"rotulo:{rotulo}|linha_seguinte"
+                        return c
+
+    return None
+
+
+def _primeiro_cnpj(texto: str, rotulo_log: dict, campo: str) -> str | None:
+    """Último recurso: primeiro CNPJ válido do texto."""
+    for m in RE_CNPJ.finditer(texto):
+        c = _cnpj_valido(m.group(1))
+        if c:
+            rotulo_log[campo] = "fallback:primeiro_cnpj"
+            return c
+    return None
+
+
+def _maior_valor_seguro(texto: str, rotulo_log: dict, campo: str) -> float | None:
+    """Último recurso: maior valor em linha não proibida.
+
+    Diferente do fallback antigo, ignora linhas com CGF, número da guia,
+    documento de origem, código de barras e afins.
+    """
+    candidatos = []
+    for linha in texto.split("\n"):
+        if _linha_proibida(linha):
+            continue
+        for m in RE_VALOR.finditer(linha):
+            v = _valor_valido(m.group(1))
+            if v is not None:
+                candidatos.append(v)
+    if not candidatos:
+        return None
+    rotulo_log[campo] = "fallback:maior_valor_seguro"
+    return max(candidatos)
+
+
+def _buscar_numero_por_rotulo(
+    texto: str, rotulos: tuple[str, ...], rotulo_log: dict, campo: str
+) -> str | None:
+    """Procura um número de documento (guia, NF) após o rótulo."""
+    linhas = texto.split("\n")
+    for rotulo in rotulos:
+        try:
+            re_rotulo = re.compile(rotulo, re.IGNORECASE)
+        except re.error:
+            continue
+        for i, linha in enumerate(linhas):
+            m = re_rotulo.search(_sem_acento(linha.lower()))
+            if not m:
+                continue
+            resto = linha[m.end() :]
+            achado = re.search(r"\b(\d{3,20})\b", resto)
+            if achado:
+                rotulo_log[campo] = f"rotulo:{rotulo}|mesma_linha"
+                return achado.group(1)
+            if i + 1 < len(linhas):
+                achado = re.search(r"\b(\d{3,20})\b", linhas[i + 1])
+                if achado:
+                    rotulo_log[campo] = f"rotulo:{rotulo}|linha_seguinte"
+                    return achado.group(1)
+    return None
+
+
+def _buscar_texto_por_rotulo(
+    texto: str, rotulos: tuple[str, ...], rotulo_log: dict, campo: str
+) -> str | None:
+    """Procura um texto curto após o rótulo."""
+    linhas = texto.split("\n")
+    for rotulo in rotulos:
+        try:
+            re_rotulo = re.compile(rotulo, re.IGNORECASE)
+        except re.error:
+            continue
+        for i, linha in enumerate(linhas):
+            m = re_rotulo.search(_sem_acento(linha.lower()))
+            if not m:
+                continue
+            resto = linha[m.end() :].strip(" :-\t")
+            if resto and len(resto) <= 60:
+                rotulo_log[campo] = f"rotulo:{rotulo}|mesma_linha"
+                return resto
+            if i + 1 < len(linhas):
+                prox = linhas[i + 1].strip()
+                if prox and len(prox) <= 60:
+                    rotulo_log[campo] = f"rotulo:{rotulo}|linha_seguinte"
+                    return prox
+    return None
+
+
+def _buscar_nome_razao_social(texto: str, rotulo_log: dict) -> str | None:
+    """Procura a razão social do contribuinte na guia.
+
+    No DARE, o nome vem logo abaixo do rótulo "NOME / RAZÃO SOCIAL".
+    """
+    linhas = texto.split("\n")
+    for i, linha in enumerate(linhas):
+        baixa = _sem_acento(linha.lower())
+        if "nome" in baixa and "razao" in baixa:
+            for j in range(i + 1, min(i + 4, len(linhas))):
+                cand = linhas[j].strip()
+                if not cand or len(cand) < 4:
+                    continue
+                if _sem_acento(cand.lower()).startswith("cnpj"):
+                    continue
+                if re.fullmatch(r"[\d\s./-]+", cand):
+                    continue
+                rotulo_log["cliente"] = f"rotulo:nome_razao_social|linha_{j - i}"
+                return cand[:120]
+    return None
+
+
+def _buscar_nome_pagador(texto: str, rotulo_log: dict) -> str | None:
+    """Procura o nome do pagador no comprovante."""
+    linhas = texto.split("\n")
+    for i, linha in enumerate(linhas):
+        baixa = _sem_acento(linha.lower())
+        if "pagador" in baixa or "cliente:" in baixa:
+            m = re.search(r"(?:pagador|cliente)\s*:?\s*(.+)", linha, re.IGNORECASE)
+            if m:
+                nome = m.group(1).strip(" :-\t")
+                if nome and len(nome) >= 3 and not re.fullmatch(r"[\d\s./-]+", nome):
+                    rotulo_log["nome_pagador"] = "rotulo:pagador|mesma_linha"
+                    return nome[:120]
+            if i + 1 < len(linhas):
+                prox = linhas[i + 1].strip()
+                if prox and len(prox) >= 3 and not re.fullmatch(r"[\d\s./-]+", prox):
+                    rotulo_log["nome_pagador"] = "rotulo:pagador|linha_seguinte"
+                    return prox[:120]
+    return None
+
+
+def _buscar_autenticacao(texto: str, rotulo_log: dict) -> str | None:
+    """Procura o número de autenticação do comprovante."""
+    m = re.search(
+        r"autentica[cç][aã]o\s*:?\s*([A-Z0-9.\-]{6,})",
+        texto,
+        re.IGNORECASE,
+    )
+    if m:
+        rotulo_log["autenticacao"] = "rotulo:autenticacao"
+        return m.group(1).strip()
+    return None
+
+
+def _buscar_beneficiario(texto: str, rotulo_log: dict) -> str | None:
+    """Procura o beneficiário do pagamento."""
+    m = re.search(r"benefici[aá]rio\s*:?\s*(.+)", texto, re.IGNORECASE)
+    if m:
+        nome = m.group(1).strip(" :-\t")
+        if nome:
+            rotulo_log["beneficiario"] = "rotulo:beneficiario"
+            return nome[:120]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# EXTRAÇÃO POR TIPO
+# ---------------------------------------------------------------------------
+
+
+def _extrair_guia(texto: str, rotulo_log: dict) -> dict:
+    """Extrai os campos de uma guia (DARE ou padrão)."""
     campos = {}
 
-    # ---- Bloco de valores ----
-    # O bloco comeca no CNPJ e segue a ordem dos rotulos. O padrao ancora
-    # no CNPJ (formato inequivoco) e captura a sequencia de valores.
-    m = re.search(
-        r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\s*\n"  # CNPJ
-        r"\s*(\d{2}/\d{2}/\d{4})\s*\n"  # Vencimento
-        r"\s*([^\n]+)\s*\n"  # Razao social
-        r"\s*([^\n]+)\s*\n"  # Tributo
-        r"\s*(\d{4})\s*\n"  # Codigo do tributo
-        r"\s*(\d{2}/\d{4})\s*\n"  # Referencia
-        r"\s*(\S+)\s*\n"  # Regime especial
-        r"\s*(\d{2}/\d{2}/\d{4})\s*\n"  # Entrada
-        r"\s*(\d+)\s*\n"  # Documento de origem
-        r"\s*([\d.,]+)\s*\n"  # Valor da receita
-        r"\s*([\d.,]+)\s*\n"  # Multa
-        r"\s*([\d.,]+)\s*\n"  # Juros
-        r"\s*([\d.,]+)\s*\n"  # Atualizacao monetaria
-        r"\s*([\d.,]+)",  # Total
+    campos["valor_guia"] = _buscar_valor_por_rotulo(
+        texto, ROTULOS_VALOR_GUIA, rotulo_log, "valor_guia"
+    )
+    if campos["valor_guia"] is None:
+        campos["valor_guia"] = _maior_valor_seguro(texto, rotulo_log, "valor_guia")
+
+    campos["data_vencimento"] = _buscar_data_por_rotulo(
+        texto, ROTULOS_DATA_GUIA, rotulo_log, "data_vencimento"
+    )
+    campos["data_emissao"] = _buscar_data_por_rotulo(
         texto,
+        (r"data\s*de\s*emissao", r"data\s*de\s*emissão", r"emissao", r"emissão"),
+        rotulo_log,
+        "data_emissao",
     )
 
-    if m:
-        (
-            cnpj_bruto,
-            vencimento,
-            razao,
-            tributo,
-            codigo_tributo,
-            referencia,
-            regime,
-            entrada,
-            doc_origem,
-            valor_receita,
-            multa,
-            juros,
-            atualizacao,
-            total,
-        ) = m.groups()
+    campos["cnpj"] = _buscar_cnpj_por_rotulo(
+        texto, ROTULOS_CNPJ_PAGADOR, rotulo_log, "cnpj"
+    )
+    if not campos["cnpj"]:
+        campos["cnpj"] = _primeiro_cnpj(texto, rotulo_log, "cnpj")
 
-        cnpj = _cnpj_valido(cnpj_bruto)
-        if cnpj:
-            campos["cnpj"] = cnpj
+    campos["numero_guia"] = _buscar_numero_por_rotulo(
+        texto, ROTULOS_NUMERO_GUIA, rotulo_log, "numero_guia"
+    )
+    campos["numero_nf"] = _buscar_numero_por_rotulo(
+        texto, ROTULOS_NUMERO_NF, rotulo_log, "numero_nf"
+    )
+    campos["tributo"] = _buscar_texto_por_rotulo(
+        texto, ROTULOS_TRIBUTO, rotulo_log, "tributo"
+    )
+    campos["cliente"] = _buscar_nome_razao_social(texto, rotulo_log)
 
-        campos["data_vencimento"] = vencimento
-        campos["data_entrada"] = entrada
-        campos["referencia"] = referencia
-        campos["regime_especial"] = regime
-        campos["documento_origem"] = doc_origem
-        campos["codigo_tributo"] = codigo_tributo
-        campos["valor_receita"] = _num(valor_receita)
-        campos["multa"] = _num(multa)
-        campos["juros"] = _num(juros)
-        campos["atualizacao_monetaria"] = _num(atualizacao)
-        campos["valor_guia"] = _num(total)
+    return campos
 
-        nome = re.sub(r"\s+", " ", razao).strip(" .-")
-        if len(nome) >= 4:
-            campos["cliente"] = nome
-            campos["tomador"] = nome
 
-        campos["tributo"] = tributo.strip()
+def _extrair_comprovante_jadlog(texto: str, rotulo_log: dict) -> dict:
+    """Extrai os campos do comprovante de pagamento da guia."""
+    campos = {}
 
-    # ---- Campos fora do bloco ----
+    campos["valor_pago_jadlog"] = _buscar_valor_por_rotulo(
+        texto, ROTULOS_VALOR_JADLOG, rotulo_log, "valor_pago_jadlog"
+    )
+    if campos["valor_pago_jadlog"] is None:
+        campos["valor_pago_jadlog"] = _maior_valor_seguro(
+            texto, rotulo_log, "valor_pago_jadlog"
+        )
 
-    # Data de emissao: o OCR da DARE embaralha a ordem. O rotulo
-    # "Data de Emissão" fica no bloco de rotulos, mas a data que aparece
-    # logo depois dele e o VENCIMENTO (16/09/2026), nao a emissao. A
-    # emissao real (14/09/2026) fica no bloco de valores, junto da
-    # entrada. Por isso a entrada vem primeiro: neste modelo, emissao e
-    # entrada tem a mesma data.
-    if campos.get("data_entrada"):
-        campos["data_emissao"] = campos["data_entrada"]
-    else:
-        m = re.search(r"Data\s*de\s*Emiss[ãa]o[\s\S]{0,60}?(\d{2}/\d{2}/\d{4})", texto)
-        if m:
-            campos["data_emissao"] = m.group(1)
+    campos["data_pagamento_jadlog"] = _buscar_data_por_rotulo(
+        texto, ROTULOS_DATA_JADLOG, rotulo_log, "data_pagamento_jadlog"
+    )
 
-    # Numero da guia: 13 digitos. Na DARE, so o numero da guia tem 13
-    # digitos, entao nao ha ambiguidade. Nao ancora no rotulo porque o
-    # OCR separa "Nº da Guia" do valor por varias linhas.
-    m = re.search(r"\b(\d{13})\b", texto)
-    if m:
-        campos["numero_guia"] = m.group(1)
+    campos["cnpj_pagador"] = _buscar_cnpj_por_rotulo(
+        texto, ROTULOS_CNPJ_PAGADOR, rotulo_log, "cnpj_pagador"
+    )
+    campos["nome_pagador"] = _buscar_nome_pagador(texto, rotulo_log)
+    campos["autenticacao"] = _buscar_autenticacao(texto, rotulo_log)
+    campos["beneficiario"] = _buscar_beneficiario(texto, rotulo_log)
 
-    # Notas fiscais: o numero da NF (10947) aparece logo depois do numero
-    # de entrada (44018286), repetido duas vezes (via e verso). Ancora
-    # nesse contexto.
-    m = re.search(r"44018286\s*\n\s*44018286\s*\n\s*(\d{3,9})", texto)
-    if not m:
-        m = re.search(r"44018286\s*\n\s*(\d{3,9})", texto)
-    if m:
-        campos["numero_nf"] = m.group(1)
+    return campos
 
-    # Posto fiscal
-    m = re.search(r"Posto Fiscal[\s\S]{0,40}?([A-ZÀ-Ú][^\n]{2,40})", texto)
-    if m:
-        campos["posto_fiscal"] = m.group(1).strip()
+
+def _extrair_comprovante_cliente(texto: str, rotulo_log: dict) -> dict:
+    """Extrai os campos do comprovante de reembolso do cliente."""
+    campos = {}
+
+    campos["valor_reembolso"] = _buscar_valor_por_rotulo(
+        texto, ROTULOS_VALOR_CLIENTE, rotulo_log, "valor_reembolso"
+    )
+    if campos["valor_reembolso"] is None:
+        campos["valor_reembolso"] = _maior_valor_seguro(
+            texto, rotulo_log, "valor_reembolso"
+        )
+
+    campos["data_reembolso"] = _buscar_data_por_rotulo(
+        texto, ROTULOS_DATA_CLIENTE, rotulo_log, "data_reembolso"
+    )
+
+    campos["cnpj_pagador"] = _buscar_cnpj_por_rotulo(
+        texto, ROTULOS_CNPJ_PAGADOR, rotulo_log, "cnpj_pagador"
+    )
+    campos["nome_pagador"] = _buscar_nome_pagador(texto, rotulo_log)
 
     return campos
 
 
 # ---------------------------------------------------------------------------
-# GUIA
+# API PÚBLICA
 # ---------------------------------------------------------------------------
-def extrair_guia(caminho: Path) -> dict:
-    texto = extrair_texto(caminho)
-    cache = layout_cache.buscar_layout(TipoDoc.GUIA, texto) or {}
-    rotulos_usados = {}
-
-    razao = _razao_social_apos_rotulo(texto, ROTULOS_RAZAO_SOCIAL)
-
-    campos = {
-        "numero_guia": "",
-        "numero_nf": _extrair_nf(texto),
-        "cliente": razao,
-        "tomador": razao,
-        "cnpj": _cnpj_guia(texto, razao),
-        "uf": "",
-        "tributo": "",
-        "valor_guia": None,
-        "data_emissao": None,
-        "data_vencimento": None,
-        "chave_nfe": "",
-    }
-
-    confianca = 0
-    if razao:
-        confianca += 10
-
-    m = re.search(
-        r"chave\s*(?:de\s*)?acesso[:\s]*([\d\s]{44,60})", texto, re.IGNORECASE
-    )
-    if m:
-        campos["chave_nfe"] = re.sub(r"\s", "", m.group(1))[:44]
-        confianca += 10
-
-    m = re.search(
-        r"(?:n[uú]mero|n[ºo])\s*(?:da\s*)?guia[:\s]*([\w./-]{4,30})",
-        texto,
-        re.IGNORECASE,
-    )
-    if m:
-        campos["numero_guia"] = m.group(1).strip()
-        confianca += 10
-
-    for trib in ("DARE", "GNRE", "DIFAL", "ICMS", "FECP", "ANTECIPA"):
-        if trib in texto.upper():
-            campos["tributo"] = trib
-            confianca += 10
-            break
-
-    m = re.search(rf"\b({UFS})\b", texto)
-    if m:
-        campos["uf"] = m.group(1)
-        confianca += 5
-
-    valor, rotulo = _valor_com_cache(
-        texto,
-        [
-            r"total\s*a\s*pagar",
-            r"total",
-            r"principal",
-            r"valor\s*(?:total|da\s*guia|a\s*pagar)",
-        ],
-        cache.get("valor_guia"),
-    )
-    campos["valor_guia"] = valor
-    if valor:
-        confianca += 20
-        if rotulo:
-            rotulos_usados["valor_guia"] = rotulo
-
-    data_em, rotulo = _data_com_cache(
-        texto,
-        [r"data\s*emiss[ãa]o", r"emiss[ãa]o"],
-        cache.get("data_emissao"),
-    )
-    campos["data_emissao"] = data_em
-    if data_em:
-        confianca += 10
-        if rotulo:
-            rotulos_usados["data_emissao"] = rotulo
-
-    data_venc, rotulo = _data_com_cache(
-        texto,
-        [r"data\s*limite\s*pagamento", r"vencimento"],
-        cache.get("data_vencimento"),
-    )
-    campos["data_vencimento"] = data_venc
-    if data_venc:
-        confianca += 10
-        if rotulo:
-            rotulos_usados["data_vencimento"] = rotulo
-
-    if campos["numero_nf"]:
-        confianca += 15
-    if campos["cnpj"]:
-        confianca += 10
-
-    # ---- Fallback para o modelo DARE ----
-    # O extrator padrao roda primeiro. Se os campos obrigatorios vierem
-    # vazios, tenta o modelo DARE. So preenche o que estiver faltando:
-    # nada do que o extrator padrao ja leu e sobrescrito.
-    if not campos["valor_guia"] or not campos["data_vencimento"]:
-        dare = _extrair_dare(texto)
-        if dare:
-            for chave, valor_dare in dare.items():
-                if not campos.get(chave):
-                    campos[chave] = valor_dare
-            campos["modelo"] = "DARE"
-            log.info("Guia no modelo DARE: %s", caminho.name)
-
-            # Recalcula a confianca com os campos recuperados
-            if campos["valor_guia"]:
-                confianca += 20
-            if campos["data_vencimento"]:
-                confianca += 10
-            if campos["data_emissao"]:
-                confianca += 10
-            if campos["numero_nf"]:
-                confianca += 15
-            if campos["cnpj"]:
-                confianca += 10
-            if campos["numero_guia"]:
-                confianca += 10
-    else:
-        campos["modelo"] = "PADRAO"
-
-    campos["confianca"] = min(confianca, 100)
-    campos["tipo"] = TipoDoc.GUIA
-    campos["texto"] = texto
-    campos["_rotulos"] = rotulos_usados
-    return campos
 
 
-# ---------------------------------------------------------------------------
-# COMPROVANTE JADLOG
-# ---------------------------------------------------------------------------
-def extrair_comprovante_jadlog(caminho: Path) -> dict:
-    texto = extrair_texto(caminho)
-    cache = layout_cache.buscar_layout(TipoDoc.COMP_JADLOG, texto) or {}
-    rotulos_usados = {}
-
-    campos = {
-        "nome_pagador": "",
-        "cnpj_pagador": "",
-        "banco": "",
-        "beneficiario": "",
-        "numero_documento": "",
-        "autenticacao": "",
-        "data_pagamento_jadlog": None,
-        "valor_pago_jadlog": None,
-    }
-
-    confianca = 0
-
-    m = re.search(r"pagador[:\s]*([A-ZÀ-Ú][^\n]{3,60})", texto, re.IGNORECASE)
-    if m:
-        campos["nome_pagador"] = m.group(1).strip()
-        confianca += 10
-
-    campos["cnpj_pagador"] = _cnpj_apos_rotulo(
-        texto, [r"cliente", r"cnpj"]
-    ) or _primeiro_cnpj(texto)
-    if campos["cnpj_pagador"]:
-        confianca += 20
-
-    m = re.search(r"benefici[áa]rio[:\s]*([A-ZÀ-Ú][^\n]{3,60})", texto, re.IGNORECASE)
-    if m:
-        campos["beneficiario"] = m.group(1).strip()
-        confianca += 10
-
-    for banco in BANCOS:
-        if banco in texto.upper():
-            campos["banco"] = banco
-            confianca += 10
-            break
-
-    m = re.search(r"autentica[çc][ãa]o[:\s]*([\w.\-/]{6,40})", texto, re.IGNORECASE)
-    if m:
-        campos["autenticacao"] = m.group(1)
-        confianca += 10
-
-    m = re.search(
-        r"(?:documento|n[ºo]\s*doc)[:\s]*([\w.\-/]{4,30})",
-        texto,
-        re.IGNORECASE,
-    )
-    if m:
-        campos["numero_documento"] = m.group(1)
-        confianca += 5
-
-    data, rotulo = _data_com_cache(
-        texto,
-        [r"data\s*do\s*pagamento", r"data\s*pagamento", r"pago\s*em"],
-        cache.get("data_pagamento_jadlog"),
-    )
-    campos["data_pagamento_jadlog"] = data
-    if data:
-        confianca += 15
-        if rotulo:
-            rotulos_usados["data_pagamento_jadlog"] = rotulo
-
-    valor, rotulo = _valor_com_cache(
-        texto,
-        [
-            r"valor\s*do\s*documento",
-            r"valor\s*pago",
-            r"valor\s*total",
-            r"valor",
-        ],
-        cache.get("valor_pago_jadlog"),
-    )
-    campos["valor_pago_jadlog"] = valor
-    if valor:
-        confianca += 20
-        if rotulo:
-            rotulos_usados["valor_pago_jadlog"] = rotulo
-
-    campos["confianca"] = min(confianca, 100)
-    campos["tipo"] = TipoDoc.COMP_JADLOG
-    campos["texto"] = texto
-    campos["_rotulos"] = rotulos_usados
-    return campos
-
-
-# ---------------------------------------------------------------------------
-# COMPROVANTE CLIENTE
-# ---------------------------------------------------------------------------
-def extrair_comprovante_cliente(caminho: Path) -> dict:
-    texto = extrair_texto(caminho)
-    cache = layout_cache.buscar_layout(TipoDoc.COMP_CLIENTE, texto) or {}
-    rotulos_usados = {}
-
-    campos = {
-        "nome_pagador": "",
-        "cnpj_pagador": "",
-        "valor_reembolso": None,
-        "data_reembolso": None,
-        "banco_origem": "",
-        "tipo_pagamento": "",
-        "id_transacao": "",
-        "agencia": "",
-        "conta": "",
-    }
-
-    confianca = 0
-
-    m = re.search(
-        r"dados\s*do\s*pagador[\s\S]{0,120}?\n([A-ZÀ-Ú][A-ZÀ-Ú&\s.]{14,80})",
-        texto,
-        re.IGNORECASE,
-    )
-    if m:
-        campos["nome_pagador"] = m.group(1).strip()
-        confianca += 10
-
-    campos["cnpj_pagador"] = _cnpj_pagador_comprovante(texto, campos["nome_pagador"])
-    if campos["cnpj_pagador"]:
-        confianca += 25
-
-    # Cadeia de valor: rotulos -> sem_virgula -> tolerante -> fallback
-    # ORDEM CORRIGIDA: sem_virgula antes de tolerante, porque 'R$ 5175'
-    # e inequivoco e o tolerante erra ao pegar CNPJ.
-    valor = None
-    rotulo = ""
-
-    # 1) Rotulos especificos
-    valor, rotulo = _valor_com_cache(
-        texto, [r"valor\s*pago", r"valor"], cache.get("valor_reembolso")
-    )
-
-    # 2) Se o valor veio de um CNPJ/CPF, descarta
-    if valor and _valor_dentro_de_documento(valor, texto):
-        log.debug("valor %s descartado: pertence a CNPJ/CPF no texto", valor)
-        valor = None
-        rotulo = ""
-
-    # 3) Valor sem virgula (OCR removeu a virgula decimal)
-    if not valor:
-        valor = _valor_sem_virgula(texto)
-        rotulo = "sem_virgula"
-
-    # 4) Tolerante (heuristica por proximidade)
-    if not valor:
-        valor = valor_tolerante(texto, caminho)
-        rotulo = "tolerante"
-
-    # 5) Fallback (ultimo recurso, ja rejeita CPF/CNPJ)
-    if not valor:
-        valor = _valor_fallback(texto)
-        rotulo = "fallback"
-
-    # 6) Valor corrompido e irrecuperavel: deixa None para revisao manual
-    if not valor and _valor_corrompido_no_texto(texto):
-        log.info("valor corrompido no OCR e nao recuperavel: %s", caminho.name)
-
-    campos["valor_reembolso"] = valor
-    if valor:
-        confianca += 25
-    if rotulo and rotulo not in ("fallback", "tolerante"):
-        rotulos_usados["valor_reembolso"] = rotulo
-
-    data, rotulo = _data_com_cache(
-        texto,
-        [
-            r"data\s*e\s*hora\s*da\s*transa[çc][ãa]o",
-            r"data\s*da\s*transa[çc][ãa]o",
-            r"data",
-        ],
-        cache.get("data_reembolso"),
-    )
-    campos["data_reembolso"] = data
-    if data:
-        confianca += 15
-        if rotulo:
-            rotulos_usados["data_reembolso"] = rotulo
-
-    up = texto.upper()
-    if "PIX" in up:
-        campos["tipo_pagamento"] = "PIX"
-        confianca += 10
-    elif "TED" in up:
-        campos["tipo_pagamento"] = "TED"
-        confianca += 10
-    elif "DOC" in up:
-        campos["tipo_pagamento"] = "DOC"
-        confianca += 10
-
-    m = re.search(r"(?:id|e2e|end-to-end)[:\s]*([\w.\-]{10,40})", texto, re.IGNORECASE)
-    if m:
-        campos["id_transacao"] = m.group(1)
-        confianca += 5
-
-    m = re.search(r"ag[êe]ncia[:\s]*([\d.\-]{2,10})", texto, re.IGNORECASE)
-    if m:
-        campos["agencia"] = m.group(1)
-
-    m = re.search(r"conta[:\s]*([\d.\-/]{3,20})", texto, re.IGNORECASE)
-    if m:
-        campos["conta"] = m.group(1)
-
-    campos["confianca"] = min(confianca, 100)
-    campos["tipo"] = TipoDoc.COMP_CLIENTE
-    campos["texto"] = texto
-    campos["_rotulos"] = rotulos_usados
-    return campos
-
-
-# ---------------------------------------------------------------------------
-# DISPATCH
-# ---------------------------------------------------------------------------
 def extrair_por_tipo(caminho: Path, tipo: str) -> dict:
     """Extrai os campos de um documento conforme o tipo.
 
-    Sempre devolve `_rotulos` (mapa campo -> rotulo usado) e `texto`
-    (texto bruto). O pipeline usa os dois para gravar o layout aprendido.
+    Devolve um dict com os campos extraídos, mais:
+    - texto: o texto bruto (limitado a 8000 chars)
+    - _rotulos: qual regra extraiu cada campo (para diagnóstico)
+    - confianca: 0-100 conforme quantos campos obrigatórios vieram
     """
+    from ocr_engine import extrair_texto
+
+    caminho = Path(caminho)
+    texto = _normalizar_texto(extrair_texto(caminho))
+    rotulo_log: dict = {}
+
     if tipo == TipoDoc.GUIA:
-        return extrair_guia(caminho)
-    if tipo == TipoDoc.COMP_JADLOG:
-        return extrair_comprovante_jadlog(caminho)
-    if tipo == TipoDoc.COMP_CLIENTE:
-        return extrair_comprovante_cliente(caminho)
-    return {
-        "tipo": tipo,
-        "confianca": 0,
-        "texto": extrair_texto(caminho),
-        "_rotulos": {},
-    }
+        campos = _extrair_guia(texto, rotulo_log)
+        obrigatorios = ("valor_guia", "data_vencimento")
+    elif tipo == TipoDoc.COMP_JADLOG:
+        campos = _extrair_comprovante_jadlog(texto, rotulo_log)
+        obrigatorios = ("valor_pago_jadlog", "data_pagamento_jadlog")
+    elif tipo == TipoDoc.COMP_CLIENTE:
+        campos = _extrair_comprovante_cliente(texto, rotulo_log)
+        obrigatorios = ("valor_reembolso", "data_reembolso")
+    else:
+        campos = {}
+        obrigatorios = ()
+
+    # Confiança: proporção de campos obrigatórios preenchidos
+    if obrigatorios:
+        preenchidos = sum(1 for c in obrigatorios if campos.get(c))
+        confianca = int(100 * preenchidos / len(obrigatorios))
+    else:
+        confianca = 0
+
+    campos["texto"] = texto[:8000]
+    campos["_rotulos"] = rotulo_log
+    campos["confianca"] = confianca
+    campos["tipo"] = tipo
+
+    log.info(
+        "Extração %s (%s): %s | confiança %d%%",
+        caminho.name,
+        tipo,
+        ", ".join(f"{k}={v}" for k, v in rotulo_log.items()) or "nenhum campo",
+        confianca,
+    )
+
+    return campos
+
+
+def extrair_guia(caminho: Path) -> dict:
+    """Atalho para extrair uma guia."""
+    return extrair_por_tipo(caminho, TipoDoc.GUIA)
+
+
+def extrair_comprovante_jadlog(caminho: Path) -> dict:
+    """Atalho para extrair um comprovante Jadlog."""
+    return extrair_por_tipo(caminho, TipoDoc.COMP_JADLOG)
+
+
+def extrair_comprovante_cliente(caminho: Path) -> dict:
+    """Atalho para extrair um comprovante do cliente."""
+    return extrair_por_tipo(caminho, TipoDoc.COMP_CLIENTE)

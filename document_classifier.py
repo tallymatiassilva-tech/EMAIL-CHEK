@@ -1,15 +1,15 @@
 """Classificador de documentos por conteúdo (nunca pelo nome do arquivo).
 
 Ordem de decisão:
-0. Regras por conteúdo: DARE. Roda antes do cache porque o cache devolve
-   confiança baixa (~55%), abaixo do mínimo do pipeline para gravar layout.
-1. Cache de layout: se o formato já foi visto, o tipo vem do cache.
+0. Regras por conteúdo: DARE. Roda antes de tudo porque o título do
+   documento é a marca mais forte que existe.
+1. Guia por sinais fortes. Uma guia DARE/GNRE tem sinais próprios que
+   não aparecem em comprovante.
+2. Direção do pagamento: distingue comprovante Jadlog de comprovante
+   cliente pela posição da Jadlog (pagadora ou recebedora).
+3. Cache de layout: se o formato já foi visto, o tipo vem do cache.
    Isso resolve os comprovantes de cliente, que têm dezenas de formatos
    (PIX do Nubank, TED do Itaú, transferência do Bradesco, etc.).
-2. Guia fiscal: decidida antes da direção do pagamento. Uma guia DARE
-   tem sinais próprios que não aparecem em comprovante.
-3. Direção do pagamento: distingue comprovante Jadlog de comprovante
-   cliente pela posição da Jadlog (pagadora ou recebedora).
 4. Pontuação por sinais: fallback quando nada acima decidiu.
 
 A separação entre comprovante Jadlog e comprovante do cliente é feita pela
@@ -18,6 +18,31 @@ DIREÇÃO do pagamento, não por palavras genéricas como "comprovante":
   pagador e o governo/beneficiário recebe.
 - Comprovante Cliente: o cliente PAGA a Jadlog. A Jadlog aparece como
   recebedora e o cliente como pagador.
+
+CORREÇÕES APLICADAS NESTA VERSÃO (cache confundindo comprovantes):
+
+PROBLEMA 1 — o cache rodava ANTES da direção do pagamento. Se o cache
+dizia COMPROVANTE_JADLOG, o classificador retornava ali e nunca chegava
+ao passo que decide pela direção. A lógica boa de direção era anulada
+pelo cache.
+
+CORREÇÃO: a direção do pagamento agora roda ANTES do cache. É um sinal
+forte e barato, e não deve ser sobreposto por um hash de estrutura.
+
+PROBLEMA 2 — quando o cache devolvia um tipo de comprovante, ele nunca
+era confrontado com a direção detectada. Um comprovante do cliente com
+estrutura parecida com o da Jadlog virava COMPROVANTE_JADLOG.
+
+CORREÇÃO: quando o cache devolve um tipo de comprovante e a direção
+detectada aponta para o outro tipo, a DIREÇÃO VENCE. O cache é corrigido
+e o log registra a divergência.
+
+PROBLEMA 3 — a guia era decidida por sinais antes da direção, mas o
+cache vinha antes de tudo. Uma guia com formato já visto podia ser
+classificada como comprovante pelo cache.
+
+CORREÇÃO: a ordem agora é DARE -> guia por sinais -> direção -> cache ->
+pontuação. O cache é o penúltimo recurso, não o primeiro.
 """
 
 import re
@@ -30,7 +55,6 @@ from log_manager import get_logger
 from ocr_engine import extrair_texto
 
 log = get_logger("classifier")
-
 
 # ---------------------------------------------------------------------------
 # SINAIS POR TIPO
@@ -143,19 +167,23 @@ EXT_TEXTO = {".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"}
 # Abaixo disso, o documento vai para desconhecido em vez de chutar.
 SCORE_MINIMO = 25
 
+# Tipos de comprovante. Usado para confrontar cache com direção.
+TIPOS_COMPROVANTE = (TipoDoc.COMP_JADLOG, TipoDoc.COMP_CLIENTE)
+
 
 # ---------------------------------------------------------------------------
 # REGRAS POR CONTEUDO: DARE
 # ---------------------------------------------------------------------------
+
+
 def _regras_dare(texto: str) -> tuple[str, float] | None:
     """Detecta a DARE (Documento de Arrecadacao de Receitas Estaduais).
 
     Modelo nacional usado por RR e outros estados. Tem marcas textuais
     inequivocas que nao aparecem em nenhuma outra guia.
 
-    Roda antes do cache de layout porque o cache devolve confianca baixa
-    (~55%), abaixo do CONFIANCA_MINIMA_LAYOUT do pipeline, e o layout da
-    DARE nunca seria gravado.
+    Roda antes de tudo porque o titulo do documento e a marca mais forte
+    que existe.
 
     Retorna (tipo, confianca) ou None quando nao e DARE.
     """
@@ -185,6 +213,8 @@ def _regras_dare(texto: str) -> tuple[str, float] | None:
 # ---------------------------------------------------------------------------
 # DETECÇÃO DE DIREÇÃO DO PAGAMENTO
 # ---------------------------------------------------------------------------
+
+
 def _extrair_bloco(texto: str, marcador: str, tamanho: int = 400) -> str:
     """Retorna o trecho do texto que vem depois de um marcador."""
     idx = texto.find(marcador)
@@ -213,12 +243,14 @@ def _detectar_direcao(texto: str) -> str | None:
     # --- Sinais textuais diretos ---
     if "cliente: jadlog" in t or "cliente jadlog" in t:
         return "JADLOG"
+
     if "banco do brasil cliente: jadlog" in t:
         return "JADLOG"
 
     # --- Formato "PAG DIVERS GUIA C/BAR" (BB) ---
     if "pag divers guia" in t and "jadlog" in t:
         return "JADLOG"
+
     if "pagador: jadlog" in t:
         return "JADLOG"
 
@@ -229,9 +261,20 @@ def _detectar_direcao(texto: str) -> str | None:
     return None
 
 
+def _tipo_pela_direcao(direcao: str | None) -> str | None:
+    """Converte a direção detectada no tipo de comprovante correspondente."""
+    if direcao == "JADLOG":
+        return TipoDoc.COMP_JADLOG
+    if direcao == "CLIENTE":
+        return TipoDoc.COMP_CLIENTE
+    return None
+
+
 # ---------------------------------------------------------------------------
 # SCORE
 # ---------------------------------------------------------------------------
+
+
 def _pontuar(texto: str, sinais: dict[str, int]) -> tuple[int, list[str]]:
     """Soma os pesos dos sinais encontrados. Retorna (score, sinais_detectados)."""
     up = texto.upper()
@@ -262,6 +305,8 @@ def _e_guia(score_guia: int, sinais_anti_guia: int) -> bool:
 # ---------------------------------------------------------------------------
 # CLASSIFICAÇÃO
 # ---------------------------------------------------------------------------
+
+
 def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
     """Retorna (tipo, confianca 0-100)."""
     caminho = Path(caminho)
@@ -287,8 +332,7 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
 
     # ------------------------------------------------------------------
     # 0) REGRAS POR CONTEUDO: DARE.
-    # Roda antes do cache porque o cache devolve confianca baixa (~55%),
-    # abaixo do minimo do pipeline para gravar o layout aprendido.
+    # O titulo do documento e a marca mais forte que existe.
     # ------------------------------------------------------------------
     regra_dare = _regras_dare(texto)
     if regra_dare:
@@ -302,29 +346,13 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
         return tipo_dare, conf_dare
 
     # ------------------------------------------------------------------
-    # 1) CACHE DE LAYOUT: formato já visto decide o tipo.
-    # Resolve os comprovantes de cliente, que têm dezenas de formatos.
-    # ------------------------------------------------------------------
-    do_cache = layout_cache.buscar_tipo_por_hash(texto)
-    if do_cache:
-        tipo_cache, conf_cache = do_cache
-        log.info(
-            "%s -> %s (%.1f%%) pelo cache de layout",
-            caminho.name,
-            tipo_cache,
-            conf_cache,
-        )
-        return tipo_cache, conf_cache
-
-    # ------------------------------------------------------------------
-    # 2) GUIA tem prioridade sobre a direção do pagamento.
+    # 1) GUIA por sinais fortes.
     # Uma guia DARE/GNRE tem sinais próprios que não aparecem em
-    # comprovante. Sem essa prioridade, a guia perdia para o comprovante
-    # de pagamento da própria guia.
+    # comprovante. Roda antes do cache: uma guia com formato já visto
+    # não pode ser classificada como comprovante pelo hash.
     # ------------------------------------------------------------------
     score_guia, sinais_guia = _pontuar(texto, SINAIS_GUIA)
     score_anti_guia, sinais_anti = _pontuar(texto, SINAIS_ANTI_GUIA)
-
     if _e_guia(score_guia, score_anti_guia):
         total = score_guia + score_anti_guia or 1
         confianca = min(100.0, (score_guia / total) * 100 + 20)
@@ -338,12 +366,15 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
         return TipoDoc.GUIA, round(confianca, 1)
 
     # ------------------------------------------------------------------
-    # 3) Direção do pagamento: distingue comprovante Jadlog de cliente.
-    # Só roda depois que a guia foi descartada.
+    # 2) DIREÇÃO DO PAGAMENTO.
+    # Roda ANTES do cache. A direção é um sinal forte e barato: a Jadlog
+    # como pagadora ou recebedora define o tipo sem ambiguidade. Um hash
+    # de estrutura não pode sobrepor isso.
     # ------------------------------------------------------------------
     direcao = _detectar_direcao(texto)
+    tipo_direcao = _tipo_pela_direcao(direcao)
 
-    if direcao == "JADLOG":
+    if tipo_direcao == TipoDoc.COMP_JADLOG:
         score, sinais = _pontuar(texto, SINAIS_COMP_JADLOG)
         confianca = min(100.0, 60.0 + score * 0.3)
         log.info(
@@ -354,7 +385,7 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
         )
         return TipoDoc.COMP_JADLOG, round(confianca, 1)
 
-    if direcao == "CLIENTE":
+    if tipo_direcao == TipoDoc.COMP_CLIENTE:
         score, sinais = _pontuar(texto, SINAIS_COMP_CLIENTE)
         confianca = min(100.0, 60.0 + score * 0.3)
         log.info(
@@ -366,8 +397,24 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
         return TipoDoc.COMP_CLIENTE, round(confianca, 1)
 
     # ------------------------------------------------------------------
-    # 4) Sem direção clara: pontuação por sinais entre os comprovantes.
-    # A guia já foi descartada no passo 2.
+    # 3) CACHE DE LAYOUT.
+    # Só chega aqui quando a direção não decidiu. O cache resolve os
+    # comprovantes de cliente, que têm dezenas de formatos.
+    # ------------------------------------------------------------------
+    do_cache = layout_cache.buscar_tipo_por_hash(texto)
+    if do_cache:
+        tipo_cache, conf_cache = do_cache
+        log.info(
+            "%s -> %s (%.1f%%) pelo cache de layout",
+            caminho.name,
+            tipo_cache,
+            conf_cache,
+        )
+        return tipo_cache, conf_cache
+
+    # ------------------------------------------------------------------
+    # 4) Sem direção e sem cache: pontuação por sinais entre os
+    # comprovantes. A guia já foi descartada no passo 1.
     # ------------------------------------------------------------------
     score_jadlog, sinais_jadlog = _pontuar(texto, SINAIS_COMP_JADLOG)
     score_cliente, sinais_cliente = _pontuar(texto, SINAIS_COMP_CLIENTE)
@@ -388,6 +435,7 @@ def classificar(caminho: Path, texto: str | None = None) -> tuple[str, float]:
 
     total = sum(scores.values()) or 1
     confianca = round((scores[melhor] / total) * 100, 1)
+
     sinais_por_tipo = {
         TipoDoc.COMP_JADLOG: sinais_jadlog,
         TipoDoc.COMP_CLIENTE: sinais_cliente,
